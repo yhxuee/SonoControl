@@ -1,0 +1,771 @@
+diff -ruN /home/claude/orig/include/experiment.hpp /home/claude/fixed/include/experiment.hpp
+--- /home/claude/orig/include/experiment.hpp	2026-05-19 05:58:23.725618383 +0000
++++ /home/claude/fixed/include/experiment.hpp	2026-05-19 05:48:32.342580544 +0000
+@@ -44,6 +44,10 @@
+ 
+     void request_stop();
+     void emergency_stop_noexcept();
++    // Aggressive stop: sets the stop flag AND cancels any pending serial/UDP
++    // I/O on the worker thread so a wedged WriteFile/sendto returns immediately.
++    // Safe to call from any thread, including from a GUI watchdog timer.
++    void force_stop();
+     int run();
+ 
+ private:
+diff -ruN /home/claude/orig/include/serial_port.hpp /home/claude/fixed/include/serial_port.hpp
+--- /home/claude/orig/include/serial_port.hpp	2026-05-19 05:58:23.725698517 +0000
++++ /home/claude/fixed/include/serial_port.hpp	2026-05-19 05:47:50.802737231 +0000
+@@ -37,6 +37,13 @@
+     std::vector<uint8_t> read_available(size_t max_size);
+     void reset_input_buffer();
+ 
++    // Cancel any pending synchronous WriteFile/ReadFile on this handle from
++    // another thread. Safe to call at any time, including when the port is
++    // closed. Used by emergency-stop / watchdog paths to unblock a worker
++    // thread that is wedged inside a USB-serial driver call (some FTDI/CH340
++    // revisions ignore COMMTIMEOUTS under USB bus stalls).
++    void cancel_io();
++
+ private:
+ #ifdef _WIN32
+     HANDLE handle_ = INVALID_HANDLE_VALUE;
+diff -ruN /home/claude/orig/include/udp_socket.hpp /home/claude/fixed/include/udp_socket.hpp
+--- /home/claude/orig/include/udp_socket.hpp	2026-05-19 05:58:23.725731217 +0000
++++ /home/claude/fixed/include/udp_socket.hpp	2026-05-19 05:48:09.886660039 +0000
+@@ -18,6 +18,12 @@
+     bool send_to(const uint8_t* data, size_t size, const std::string& host, uint16_t port);
+     void close();
+ 
++    // Force-cancel any pending sendto() from another thread. Used by
++    // emergency-stop to unblock a worker that is wedged in a sendto loop
++    // (rare, but possible when the kernel UDP buffer is full or routing
++    // changes mid-send).
++    void cancel_io();
++
+ private:
+ #ifdef _WIN32
+     uintptr_t socket_ = static_cast<uintptr_t>(~0ull);
+diff -ruN /home/claude/orig/src/experiment.cpp /home/claude/fixed/src/experiment.cpp
+--- /home/claude/orig/src/experiment.cpp	2026-05-19 05:58:23.725889154 +0000
++++ /home/claude/fixed/src/experiment.cpp	2026-05-19 05:49:23.215027990 +0000
+@@ -42,6 +42,21 @@
+     return base * (1 << std::min(attempt, 4));
+ }
+ 
++// Sleep that wakes early when a stop flag is set. Long retry backoffs
++// (hundreds of ms to several seconds) would otherwise make EMERGENCY STOP
++// feel unresponsive — the worker thread can't observe stop_flag_ while it
++// is inside a long sleep_for. Chunking into 25 ms slices keeps total sleep
++// time accurate to ±25 ms while letting the worker react quickly.
++inline void interruptible_sleep_ms(int ms, const std::atomic<bool>& stop_flag) {
++    constexpr int kSlice = 25;
++    int remaining = std::max(0, ms);
++    while (remaining > 0 && !stop_flag.load(std::memory_order_acquire)) {
++        const int step = std::min(kSlice, remaining);
++        std::this_thread::sleep_for(std::chrono::milliseconds(step));
++        remaining -= step;
++    }
++}
++
+ 
+ } // namespace
+ 
+@@ -63,6 +78,16 @@
+     stop_flag_ = true;
+ }
+ 
++void ExperimentRunner::force_stop() {
++    // Order matters: set the flag first so that any code that recovers from a
++    // cancelled I/O sees the stop request and bails out instead of retrying.
++    stop_flag_ = true;
++    // Unblock anything currently inside the OS kernel. cancel_io is idempotent
++    // and safe to call when the handle/socket is closed.
++    try { ultrasound_serial_.cancel_io(); } catch (...) {}
++    try { udp_sender_.cancel_io(); } catch (...) {}
++}
++
+ ActiveParams ExperimentRunner::initial_params_from_config(const Config& c) {
+     return ActiveParams{c.amplitude, c.cfreq_hz, c.prf_hz, c.duty_cycle,
+                         c.duration_ms, c.interval_time_s, c.wave_shape};
+@@ -391,7 +416,7 @@
+             }
+         }
+ 
+-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
++        interruptible_sleep_ms(50, stop_flag_);
+     }
+ 
+     const bool stopped_by_user = stop_flag_.load();
+@@ -453,20 +478,33 @@
+                 ultrasound_serial_.close();
+             }
+             if (ok) break;
++            // If a stop was requested mid-attempt (force_stop cancels pending I/O),
++            // do not waste backoff time on retries — the operator is waiting for
++            // us to exit. Surface a clean abort rather than a "failed after N
++            // retries" error that obscures the user's intent.
++            if (stop_flag_) break;
+             if (attempt + 1 < attempts) {
+                 const int ms = backoff_ms_for_attempt(config_, attempt);
+                 log_console("[WARN] " + label + " write failed on " + config_.com3_port +
+                             "; retrying in " + std::to_string(ms) + " ms");
+-                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
++                interruptible_sleep_ms(ms, stop_flag_);
+             }
+         }
+         if (!ok) {
++            if (stop_flag_) {
++                // Stopped while writing — that's expected, not an error worth
++                // throwing. The caller's stop_flag check after this returns
++                // will handle the exit path.
++                return;
++            }
+             throw std::runtime_error("Failed to write ultrasound serial packet to " + config_.com3_port +
+                                      (last_error.empty() ? "" : (" (" + last_error + ")")));
+         }
+     }
+     log_console("> " + left_width(label, 5) + " " + protocol::format_hex(packet) + (config_.simulate_us ? " [SIM]" : ""));
+-    std::this_thread::sleep_for(std::chrono::duration<double>(COM_GAP_S));
++    // COM-gap sleep also needs to be interruptible: 100 ms × 5 packets per
++    // burst would otherwise add ~500 ms of latency to every emergency stop.
++    interruptible_sleep_ms(static_cast<int>(COM_GAP_S * 1000.0), stop_flag_);
+ }
+ 
+ void ExperimentRunner::transmit(const ActiveParams& params) {
+@@ -505,7 +543,7 @@
+                             log_console("[WARN] UDP waveform packet send failed at sample " + std::to_string(i) +
+                                         "; retrying with backoff");
+                         }
+-                        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
++                        interruptible_sleep_ms(ms, stop_flag_);
+                     }
+                 }
+                 if (!sent && !stop_flag_) {
+diff -ruN /home/claude/orig/src/gui/main_gui.cpp /home/claude/fixed/src/gui/main_gui.cpp
+--- /home/claude/orig/src/gui/main_gui.cpp	2026-05-19 05:58:23.725933319 +0000
++++ /home/claude/fixed/src/gui/main_gui.cpp	2026-05-19 05:58:15.058109367 +0000
+@@ -13,6 +13,7 @@
+ #include <QtCore/QFile>
+ #include <QtCore/QIODevice>
+ #include <QtCore/QMetaType>
++#include <QtCore/QMutex>
+ #include <QtCore/QSignalBlocker>
+ #include <QtCore/QTime>
+ #include <QtCore/QFileInfo>
+@@ -62,6 +63,7 @@
+ #include <atomic>
+ #include <cmath>
+ #include <filesystem>
++#include <limits>
+ #include <memory>
+ #include <optional>
+ #include <string>
+@@ -406,6 +408,13 @@
+         if (auto* r = runnerRaw_.load(std::memory_order_acquire)) r->request_stop();
+     }
+ 
++    // Aggressive variant: also cancels any pending serial/UDP I/O so a wedged
++    // worker thread unblocks immediately. Called by the EMERGENCY STOP button
++    // (after a graceful stop request) and by the stall watchdog.
++    void forceStop() {
++        if (auto* r = runnerRaw_.load(std::memory_order_acquire)) r->force_stop();
++    }
++
+ signals:
+     void console(QString);
+     void temperature(double, double);
+@@ -425,6 +434,109 @@
+     std::atomic<sonocontrol::ExperimentRunner*> runnerRaw_{nullptr};
+ };
+ 
++// Lightweight background probe that updates the COM3 / UDP / Temp status pills
++// in the header before the experiment starts. Runs on its own QThread so a slow
++// HH806AU read (~360 ms) or a stuck serial open does not stall the GUI thread.
++// Paused while an experiment is running — the runner owns the ports then.
++class StatusProbe final : public QObject {
++    Q_OBJECT
++public:
++    struct Settings {
++        QString com3_port;
++        QString com11_port;
++        QString udp_host;
++        uint16_t udp_source_port = 4561;
++        bool check_temperature = false;
++        double temp_min_c = 10.0;
++        double temp_max_c = 80.0;
++        double temp_max_rate = 15.0;
++    };
++
++    // Thread-safe writer. Called from the GUI thread whenever the user edits a
++    // port / host / monitoring checkbox. The probe loop picks up the new
++    // values on its next iteration. Calling this is *not* a Qt signal/slot
++    // emit, just a regular method call — the mutex is what makes it safe.
++    void updateSettings(const Settings& s) {
++        QMutexLocker lk(&mutex_);
++        settings_ = s;
++    }
++
++    void setPaused(bool paused) {
++        paused_ = paused;
++        if (!paused) {
++            // Kick a probe immediately when resumed so the pills update without
++            // waiting for the next periodic tick.
++            QMetaObject::invokeMethod(this, "runOnce", Qt::QueuedConnection);
++        }
++    }
++
++public slots:
++    void runOnce() {
++        if (paused_) return;
++        Settings s;
++        { QMutexLocker lk(&mutex_); s = settings_; }
++
++        // COM3 — fast open/close. If the port is missing or in use by another
++        // process the open fails immediately; if it succeeds we know the OS
++        // will let us own it at start.
++        if (!s.com3_port.isEmpty() && !s.com3_port.contains("no ports", Qt::CaseInsensitive)) {
++            sonocontrol::SerialPort port;
++            const bool ok = port.open(s.com3_port.toStdString(), 9600, 8, 'N', 1, 200);
++            port.close();
++            emit com3Status(ok);
++        } else {
++            emit com3Status(false);
++        }
++        if (paused_) return;
++
++        // UDP — try to bind the source port. If another instance of this
++        // program leaked a process, the bind fails here and the user sees the
++        // pill stay red, which is the early-warning we want.
++        {
++            sonocontrol::UdpSender udp;
++            const bool ok = udp.open(s.udp_source_port);
++            udp.close();
++            emit udpStatus(ok);
++        }
++        if (paused_) return;
++
++        // Temperature — only when monitoring is enabled, since opening the
++        // HH806AU port and waiting ~360 ms otherwise costs a probe cycle for
++        // nothing.
++        if (s.check_temperature && !s.com11_port.isEmpty() &&
++            !s.com11_port.contains("no ports", Qt::CaseInsensitive)) {
++            try {
++                sonocontrol::HH806AUSensor sensor(s.com11_port.toStdString(),
++                                                  s.temp_min_c, s.temp_max_c, s.temp_max_rate);
++                auto pair = sensor.read();
++                const bool any = pair.first.has_value() || pair.second.has_value();
++                emit tempStatus(any,
++                                pair.first.value_or(std::numeric_limits<double>::quiet_NaN()),
++                                pair.second.value_or(std::numeric_limits<double>::quiet_NaN()));
++            } catch (...) {
++                emit tempStatus(false,
++                                std::numeric_limits<double>::quiet_NaN(),
++                                std::numeric_limits<double>::quiet_NaN());
++            }
++        } else {
++            emit tempStatus(false,
++                            std::numeric_limits<double>::quiet_NaN(),
++                            std::numeric_limits<double>::quiet_NaN());
++        }
++    }
++
++signals:
++    void com3Status(bool ok);
++    void udpStatus(bool ok);
++    // ok=true when at least one channel returned a valid reading.
++    void tempStatus(bool ok, double t1, double t2);
++
++private:
++    QMutex mutex_;
++    Settings settings_;
++    std::atomic<bool> paused_{false};
++};
++
+ class SonoControlWindow final : public QMainWindow {
+     Q_OBJECT
+ public:
+@@ -451,12 +563,34 @@
+         sessionUiTimer_.setInterval(250);
+         connect(&sessionUiTimer_, &QTimer::timeout, this, &SonoControlWindow::refreshSessionTimerUi);
+         installConfigChangeTracking();
+-    }
+ 
+-    ~SonoControlWindow() override { stopWorker(true); deleteTemporaryConfigFile(); }
++        // Status probe runs in its own thread so a slow HH806AU read or a
++        // wedged serial open can't freeze the UI. It updates the header pills
++        // periodically while the experiment is idle, and pauses while a run
++        // is in progress (the runner owns the ports then).
++        setupStatusProbe();
++
++        // Stall watchdog. Independent of the experiment worker. Fires if no
++        // worker-side signal arrives for `watchdog_timeout_ms` while running,
++        // which is the signature of a USB-serial driver hang (countdown keeps
++        // ticking on the UI thread, but temperature, params, and graph stop
++        // updating). When that happens, escalate the emergency stop with a
++        // force_stop that cancels pending I/O so the worker can exit.
++        watchdogTimer_.setInterval(1000);
++        connect(&watchdogTimer_, &QTimer::timeout, this, &SonoControlWindow::checkWorkerProgress);
++    }
++
++    ~SonoControlWindow() override {
++        shutdownInProgress_ = true;
++        teardownStatusProbe();
++        stopWorker(true);
++        deleteTemporaryConfigFile();
++    }
+ 
+ protected:
+     void closeEvent(QCloseEvent* e) override {
++        shutdownInProgress_ = true;
++        teardownStatusProbe();
+         stopWorker(true);
+         deleteTemporaryConfigFile();
+         QMainWindow::closeEvent(e);
+@@ -488,10 +622,24 @@
+         idleTimer_.stop();
+         btnStart_->setEnabled(false);
+         btnStop_->setEnabled(true);
++        // Reset the emergency-stop button to its graceful state for this run.
++        btnStop_->setText(" ■  EMERGENCY STOP ");
+         lblCycle_->setText("IDLE");
+         appendConsole("=== Experiment started ===");
+         statusBar()->showMessage("Experiment running");
+ 
++        // Hand the ports over to the worker; pause idle probing so we don't
++        // race for COM3 / HH806AU. The probe will resume when running_ flips
++        // back to false in onFinished().
++        if (probe_) probe_->setPaused(true);
++
++        // Initialize the watchdog timestamp and start the timer. The watchdog
++        // is independent of the experiment thread — it lives on the GUI
++        // thread and checks elapsed time since the last worker signal.
++        lastWorkerSignalMs_ = QDateTime::currentMSecsSinceEpoch();
++        workerStallNotified_ = false;
++        watchdogTimer_.start();
++
+         workerThread_ = new QThread(this);
+         worker_ = new RunnerWorker(config_, &logger_);
+         worker_->moveToThread(workerThread_);
+@@ -514,7 +662,34 @@
+     void onStop() {
+         appendConsole(">>> EMERGENCY STOP requested");
+         statusBar()->showMessage("Emergency stop requested");
+-        if (worker_) worker_->stop();
++        if (!worker_) return;
++        worker_->stop();
++        // Visually mark the button as already pressed and disable a second
++        // graceful click — the next click should be the user explicitly
++        // asking for force-stop after they see the runner isn't responding.
++        btnStop_->setEnabled(false);
++        // Schedule an automatic escalation: if the worker hasn't exited
++        // gracefully within 2 seconds, cancel pending I/O so a wedged
++        // WriteFile/sendto unblocks and the worker can exit. The button
++        // is re-enabled with a "Force Stop" label so the user can also
++        // trigger this manually if they don't want to wait.
++        QTimer::singleShot(2000, this, [this]() {
++            if (!running_ || !worker_) return;
++            appendConsole(">>> EMERGENCY STOP escalating to force-stop (cancelling pending I/O)");
++            statusBar()->showMessage("Force-stop: cancelling pending serial/UDP I/O");
++            worker_->forceStop();
++            btnStop_->setText(" ■  FORCE STOP ");
++            btnStop_->setEnabled(true);
++        });
++    }
++
++    // Called when the user clicks the EMERGENCY STOP button after the
++    // graceful attempt timed out — at this point we go straight to force_stop.
++    void onForceStop() {
++        if (!worker_) return;
++        appendConsole(">>> User requested force-stop");
++        worker_->forceStop();
++        btnStop_->setEnabled(false);
+     }
+ 
+     void loadConfigFile() {
+@@ -532,6 +707,7 @@
+             activeConfigPath_ = path;
+             activeConfigType_ = "loaded-config";
+             updateConfigStatus();
++            pushProbeSettings();
+             appendConsole("Loaded config: " + path);
+         } catch (const std::exception& e) {
+             loadingConfigUi_ = false;
+@@ -577,11 +753,20 @@
+     void onFinished(int code) {
+         refreshSessionTimerUi();
+         sessionUiTimer_.stop();
++        watchdogTimer_.stop();
++        workerStallNotified_ = false;
+         running_ = false;
+         worker_ = nullptr;
+         workerThread_ = nullptr;
+         btnStart_->setEnabled(true);
+         btnStop_->setEnabled(false);
++        // Restore the EMERGENCY STOP label for the next run, in case a
++        // force-stop escalation re-labelled it during this one.
++        btnStop_->setText(" ■  EMERGENCY STOP ");
++        // Resume idle probing now that the worker has released the ports.
++        // setPaused(false) also kicks off a probe immediately so the pills
++        // reflect the post-run state without waiting for the next tick.
++        if (probe_ && !shutdownInProgress_) probe_->setPaused(false);
+         lblCycle_->setText(code == 0 ? "COMPLETE" : (code == 2 ? "CUTOFF" : (code == 3 ? "STOPPED" : "ERROR")));
+         lblCycle_->setStyleSheet(valueStyle(code == 0 ? "#00897b" : (code == 3 ? "#b54708" : (code == 2 ? "#d93025" : "#b42318"))));
+         if (code == 0) {
+@@ -606,6 +791,7 @@
+     }
+ 
+     void onTemperature(double t1, double t2) {
++        touchWorkerSignal();
+         const bool has_t1 = (t1 > 0);
+         const bool has_t2 = (t2 > 0);
+         lblT1_->setText(has_t1 ? QString::number(t1, 'f', 1) + QString::fromUtf8("°C") : "N/C");
+@@ -645,6 +831,7 @@
+     }
+ 
+     void onParams(sonocontrol::ActiveParams p) {
++        touchWorkerSignal();
+         lblCurAmp_->setText(QString::number(p.amplitude, 'f', 3));
+         lblCurCfreq_->setText(QString::number(p.cfreq_hz / 1000.0, 'f', 1) + " kHz");
+         lblCurPrf_->setText(QString::number(p.prf_hz, 'f', 0) + " Hz");
+@@ -656,6 +843,7 @@
+     }
+ 
+     void onTimeUpdate(double elapsed, double remaining) {
++        touchWorkerSignal();
+         // Worker-thread time updates are kept for CLI/log compatibility,
+         // but the GUI display is driven by sessionUiTimer_ to avoid visible stalls
+         // when hardware transmission or retries briefly block the experiment thread.
+@@ -678,6 +866,7 @@
+     }
+ 
+     void onCycle(const QString& phase) {
++        touchWorkerSignal();
+         if (targetHoldMode_ && phase.contains("TARGET HOLD") && !targetHoldStarted_) {
+             targetHoldStarted_ = true;
+             targetHoldStartWallS_ = startWall_.isValid() ? startWall_.elapsed() / 1000.0 : 0.0;
+@@ -686,7 +875,7 @@
+         lblCycle_->setStyleSheet(valueStyle(phase.contains("HEAT") || phase.contains("TARGET") ? "#0a9e8a" : "#5a6070"));
+     }
+ 
+-    void onWaveform(std::vector<float> w) { waveformPlot_->setWaveform(std::move(w)); }
++    void onWaveform(std::vector<float> w) { touchWorkerSignal(); waveformPlot_->setWaveform(std::move(w)); }
+ 
+     void onCutoff(double temp) {
+         fatalErrorShown_ = true;
+@@ -714,6 +903,9 @@
+     }
+ 
+     void appendConsole(const QString& msg) {
++        // Console messages count as worker progress even when the console
++        // panel is hidden: a still-talking worker is a still-alive worker.
++        touchWorkerSignal();
+         if (!consoleFrame_->isVisible()) return;   // skip when hidden — major perf win
+         console_->appendPlainText("[" + QTime::currentTime().toString("HH:mm:ss") + "] " + msg);
+     }
+@@ -821,6 +1013,9 @@
+         fill(cmbCom3_, "COM3");
+         fill(cmbCom11_, "COM5");
+         lblPortInfo_->setText(QString("%1 port(s) found: %2").arg(ports.size()).arg(ports.join(", ")));
++        // After the user clicks Scan Ports the selected port may have changed,
++        // so the probe needs to re-target. Cheap; no I/O on this thread.
++        pushProbeSettings();
+     }
+ 
+     void testTempConnection() {
+@@ -1320,7 +1515,14 @@
+             l->addSpacing(4);
+         }
+         btnStart_ = new QPushButton(" ▶  START "); btnStart_->setObjectName("start"); btnStart_->setMinimumWidth(120); btnStart_->setCursor(Qt::PointingHandCursor); connect(btnStart_, &QPushButton::clicked, this, &SonoControlWindow::onStart);
+-        btnStop_ = new QPushButton(" ■  EMERGENCY STOP "); btnStop_->setObjectName("stop"); btnStop_->setMinimumWidth(170); btnStop_->setEnabled(false); btnStop_->setCursor(Qt::PointingHandCursor); connect(btnStop_, &QPushButton::clicked, this, &SonoControlWindow::onStop);
++        btnStop_ = new QPushButton(" ■  EMERGENCY STOP "); btnStop_->setObjectName("stop"); btnStop_->setMinimumWidth(170); btnStop_->setEnabled(false); btnStop_->setCursor(Qt::PointingHandCursor);
++        // Dispatch click depending on which phase we're in: first click sends
++        // a graceful request_stop; if the worker doesn't exit in 2 s, the
++        // button is re-labelled "FORCE STOP" and the next click cancels I/O.
++        connect(btnStop_, &QPushButton::clicked, this, [this]() {
++            if (btnStop_->text().contains("FORCE", Qt::CaseInsensitive)) onForceStop();
++            else onStop();
++        });
+         l->addSpacing(6);
+         l->addWidget(btnStart_); l->addSpacing(6); l->addWidget(btnStop_);
+         return h;
+@@ -1971,6 +2173,10 @@
+ 
+     void markConfigChanged() {
+         if (loadingConfigUi_ || running_) return;
++        // Keep the idle status probe in sync with whatever the user just
++        // edited. Done before the try/catch so the probe sees changes even
++        // if the temp .config write below fails.
++        pushProbeSettings();
+         if (loadedConfigPath_.isEmpty()) {
+             activeConfigType_ = "gui-default";
+             activeConfigPath_.clear();
+@@ -2034,12 +2240,170 @@
+         return c;
+     }
+ 
++    void setupStatusProbe() {
++        probeThread_ = new QThread(this);
++        probe_ = new StatusProbe();
++        probe_->moveToThread(probeThread_);
++        connect(probeThread_, &QThread::finished, probe_, &QObject::deleteLater);
++        probeThread_->start();
++
++        probeTimer_ = new QTimer(this);
++        probeTimer_->setInterval(3000);
++        connect(probeTimer_, &QTimer::timeout, this, [this]() {
++            if (!probe_ || running_ || shutdownInProgress_) return;
++            QMetaObject::invokeMethod(probe_, "runOnce", Qt::QueuedConnection);
++        });
++        // Use QueuedConnection so handlers run on the GUI thread.
++        connect(probe_, &StatusProbe::com3Status, this, &SonoControlWindow::onProbeCom3, Qt::QueuedConnection);
++        connect(probe_, &StatusProbe::udpStatus, this, &SonoControlWindow::onProbeUdp, Qt::QueuedConnection);
++        connect(probe_, &StatusProbe::tempStatus, this, &SonoControlWindow::onProbeTemp, Qt::QueuedConnection);
++
++        pushProbeSettings();
++        probeTimer_->start();
++        // Kick off an initial probe immediately so the pills update on launch
++        // instead of waiting 3 s for the first periodic tick.
++        QMetaObject::invokeMethod(probe_, "runOnce", Qt::QueuedConnection);
++    }
++
++    void teardownStatusProbe() {
++        if (probeTimer_) probeTimer_->stop();
++        if (probeThread_) {
++            probeThread_->quit();
++            // The probe runs short operations only (each step bounded to
++            // <1 s), so a 2 s wait is generous. If it does time out we still
++            // proceed — the thread will be terminated at process exit since
++            // the probe doesn't hold any I/O handle across calls.
++            probeThread_->wait(2000);
++            probeThread_ = nullptr;
++            probe_ = nullptr;
++        }
++    }
++
++    void pushProbeSettings() {
++        if (!probe_) return;
++        StatusProbe::Settings s;
++        s.com3_port = cmbCom3_ ? cmbCom3_->currentData().toString() : QString();
++        s.com11_port = cmbCom11_ ? cmbCom11_->currentData().toString() : QString();
++        s.udp_host = txtUdpHost_ ? txtUdpHost_->text().trimmed() : QString();
++        s.udp_source_port = 4561;
++        // Only probe the temperature sensor when the user actually wants
++        // monitoring (or PID/target-hold force it). Otherwise the pill
++        // displays "Temp OFF" and we don't poll the HH806AU.
++        const bool pid = chkPid_ && chkPid_->isChecked();
++        const bool targetHold = rbTargetHold_ && rbTargetHold_->isChecked();
++        const bool monitor = chkTempMonitor_ && chkTempMonitor_->isChecked();
++        s.check_temperature = pid || targetHold || monitor;
++        s.temp_min_c = spnTempMin_ ? spnTempMin_->value() : 10.0;
++        s.temp_max_c = spnTempMax_ ? spnTempMax_->value() : 80.0;
++        s.temp_max_rate = spnTempRate_ ? spnTempRate_->value() : 15.0;
++        probe_->updateSettings(s);
++    }
++
++    void onProbeCom3(bool ok) {
++        if (running_ || !lblCom3Status_) return;
++        lblCom3Status_->setStyleSheet(statusStyle(ok ? "#1e8e3e" : "#d93025"));
++    }
++
++    void onProbeUdp(bool ok) {
++        if (running_ || !lblUsStatus_) return;
++        // Note: ok here means "we can bind the source port". If false, the
++        // most likely cause is another SonoControl process still alive — see
++        // the long-run notes in the change log.
++        lblUsStatus_->setStyleSheet(statusStyle(ok ? "#1e8e3e" : "#d93025"));
++    }
++
++    void onProbeTemp(bool ok, double t1, double t2) {
++        if (running_) return;
++        // Don't touch the pill text — that's owned by updateTemperatureSensorUi.
++        // We only change the color: green when reads succeed, red when the
++        // user wants monitoring but the sensor isn't responding, gray when
++        // monitoring is off.
++        const bool pid = chkPid_ && chkPid_->isChecked();
++        const bool targetHold = rbTargetHold_ && rbTargetHold_->isChecked();
++        const bool monitor = chkTempMonitor_ && chkTempMonitor_->isChecked();
++        const bool wants = pid || targetHold || monitor;
++        if (!wants) {
++            lblTempStatus_->setStyleSheet(statusStyle("#667085"));
++            return;
++        }
++        lblTempStatus_->setStyleSheet(statusStyle(ok ? "#1e8e3e" : (pid || targetHold ? "#d93025" : "#e6930a")));
++        // Mirror the latest reading into the side panel so the user sees the
++        // sensor is alive before pressing Start. This was the original
++        // intent of the now-removed idleTimer_, but here we do it off the
++        // GUI thread so it can't lag the UI.
++        if (ok && lblT1_ && lblT2_ && lblTavg_) {
++            const bool has_t1 = !std::isnan(t1);
++            const bool has_t2 = !std::isnan(t2);
++            lblT1_->setText(has_t1 ? QString::number(t1, 'f', 1) + QString::fromUtf8("°C") : "N/C");
++            lblT2_->setText(has_t2 ? QString::number(t2, 'f', 1) + QString::fromUtf8("°C") : "N/C");
++            double ref = 0.0;
++            int n = 0;
++            if (has_t1) { ref += t1; ++n; }
++            if (has_t2) { ref += t2; ++n; }
++            if (n > 0) lblTavg_->setText(QString::number(ref / n, 'f', 2) + QString::fromUtf8("°C"));
++        }
++    }
++
++    void checkWorkerProgress() {
++        // Fires every second while an experiment is running. If we haven't
++        // received any signal from the worker in `watchdog_timeout_ms`, the
++        // worker is likely wedged in a synchronous serial/UDP call. Surface a
++        // visible warning and auto-escalate to force_stop so the run aborts
++        // cleanly instead of leaving a zombie process holding the ports.
++        if (!running_ || !worker_ || !startWall_.isValid()) return;
++        const qint64 now_ms = QDateTime::currentMSecsSinceEpoch();
++        if (lastWorkerSignalMs_ == 0) return;
++        const qint64 since = now_ms - lastWorkerSignalMs_;
++        const int timeout = std::max(1000, config_.watchdog_timeout_ms);
++        if (since < timeout) return;
++        if (workerStallNotified_) return;
++        workerStallNotified_ = true;
++        appendConsole("[WARN] Worker has not reported progress for " +
++                      QString::number(since / 1000.0, 'f', 1) +
++                      " s. Cancelling pending I/O to recover.");
++        statusBar()->showMessage("Watchdog: worker stalled, cancelling pending I/O");
++        lblCom3Status_->setStyleSheet(statusStyle("#d93025"));
++        lblTempStatus_->setStyleSheet(statusStyle("#d93025"));
++        worker_->forceStop();
++        btnStop_->setText(" ■  FORCE STOP ");
++        btnStop_->setEnabled(true);
++    }
++
++    void touchWorkerSignal() {
++        lastWorkerSignalMs_ = QDateTime::currentMSecsSinceEpoch();
++        workerStallNotified_ = false;
++    }
++
+     void stopWorker(bool blocking) {
+         idleTimer_.stop();
+         sessionUiTimer_.stop();
++        watchdogTimer_.stop();
+         if (worker_) worker_->stop();
+         if (blocking && workerThread_) {
+-            workerThread_->wait(5000);
++            // Phase 1: give the worker 2 s to exit gracefully (it will send
++            // the hardware STOP packets on the way out).
++            if (!workerThread_->wait(2000)) {
++                // Phase 2: cancel any pending serial/UDP I/O so a wedged
++                // WriteFile/sendto on a USB-serial driver returns immediately.
++                if (worker_) worker_->forceStop();
++                // Then wait another 3 s for the now-unblocked worker to exit
++                // and emit `finished`, which fires `deleteLater` on both the
++                // worker and the thread. If we skip this wait, the QThread
++                // would be destroyed while still running and the underlying
++                // OS thread would keep the process alive with COM3/UDP
++                // handles open — which is exactly the "zombie process holds
++                // the COM port" symptom the user reported.
++                if (!workerThread_->wait(3000)) {
++                    // Last-ditch: tell Qt to terminate the OS thread. This is
++                    // unsafe in general but the alternative is a process that
++                    // never exits and prevents new SonoControl instances from
++                    // binding the ports. Log it loudly.
++                    if (workerThread_) {
++                        workerThread_->terminate();
++                        workerThread_->wait(1000);
++                    }
++                }
++            }
+         }
+     }
+ 
+@@ -2070,6 +2434,26 @@
+     QThread* workerThread_ = nullptr;
+     RunnerWorker* worker_ = nullptr;
+ 
++    // Background status probe — runs on its own QThread. See StatusProbe and
++    // setupStatusProbe(). Pointer ownership: probeThread_ is parented to
++    // `this`; probe_ is deleted via deleteLater on the thread's `finished`
++    // signal during teardownStatusProbe().
++    QThread* probeThread_ = nullptr;
++    StatusProbe* probe_ = nullptr;
++    QTimer* probeTimer_ = nullptr;
++
++    // Stall watchdog — detects when the worker thread has not reported any
++    // progress signal for `config_.watchdog_timeout_ms` and triggers a
++    // force-stop to recover. lastWorkerSignalMs_ is updated by every
++    // worker-side slot via touchWorkerSignal().
++    QTimer watchdogTimer_;
++    qint64 lastWorkerSignalMs_ = 0;
++    bool workerStallNotified_ = false;
++
++    // Set true while the window is closing so the probe doesn't try to run
++    // one more iteration after we've started tearing down its thread.
++    bool shutdownInProgress_ = false;
++
+     QPushButton *btnStart_{}, *btnStop_{}, *btnTestTemp_{};
+     QCheckBox *chkSimTemp_{}, *chkSimUs_{}, *chkPid_{}, *chkTempMonitor_{}, *chkTempFallback_{}, *chkPidAmp_{}, *chkPidDuration_{}, *chkPidInterval_{}, *chkPidDuty_{}, *chkCycling_{}, *chkConsole_{};
+     QLabel *lblCom3Status_{}, *lblUsStatus_{}, *lblTempStatus_{}, *lblPortInfo_{}, *lblTempRequirement_{}, *lblConfigStatus_{};
+diff -ruN /home/claude/orig/src/serial_port.cpp /home/claude/fixed/src/serial_port.cpp
+--- /home/claude/orig/src/serial_port.cpp	2026-05-19 05:58:23.726091871 +0000
++++ /home/claude/fixed/src/serial_port.cpp	2026-05-19 05:48:04.349104424 +0000
+@@ -120,6 +120,16 @@
+     if (is_open()) PurgeComm(handle_, PURGE_RXCLEAR);
+ }
+ 
++void SerialPort::cancel_io() {
++    // CancelIoEx with lpOverlapped=NULL cancels all pending I/O on the handle
++    // regardless of which thread issued it. Works for both overlapped and
++    // synchronous WriteFile/ReadFile, which is what we use here. A blocked
++    // call returns with ERROR_OPERATION_ABORTED so the worker thread can exit.
++    if (handle_ != INVALID_HANDLE_VALUE) {
++        ::CancelIoEx(handle_, nullptr);
++    }
++}
++
+ #else
+ 
+ namespace {
+@@ -256,6 +266,20 @@
+     if (is_open()) tcflush(fd_, TCIFLUSH);
+ }
+ 
++void SerialPort::cancel_io() {
++    // POSIX path uses select()-based read_exact with a 20 ms poll, so it is
++    // already responsive to stop_flag_ checks at the caller. write_all uses
++    // EAGAIN polling. The most reliable cross-thread interrupt is shutting
++    // down the fd, but serial fds don't accept shutdown(); closing is the
++    // standard pattern. We deliberately don't reset fd_ here — the owning
++    // thread will observe the next read/write returning EBADF and exit
++    // cleanly, then call close() which is idempotent.
++    if (fd_ >= 0) {
++        ::close(fd_);
++        fd_ = -1;
++    }
++}
++
+ #endif
+ 
+ } // namespace sonocontrol
+diff -ruN /home/claude/orig/src/udp_socket.cpp /home/claude/fixed/src/udp_socket.cpp
+--- /home/claude/orig/src/udp_socket.cpp	2026-05-19 05:58:23.726256698 +0000
++++ /home/claude/fixed/src/udp_socket.cpp	2026-05-19 05:48:26.776497096 +0000
+@@ -8,6 +8,7 @@
+ #endif
+ #include <winsock2.h>
+ #include <ws2tcpip.h>
++#include <windows.h>
+ #else
+ #include <arpa/inet.h>
+ #include <netdb.h>
+@@ -110,5 +111,18 @@
+     }
+ #endif
+ }
++
++void UdpSender::cancel_io() {
++#ifdef _WIN32
++    if (socket_ != INVALID_SOCKET) {
++        // CancelIoEx on a SOCKET wakes any sendto/recvfrom blocked on it.
++        ::CancelIoEx(reinterpret_cast<HANDLE>(static_cast<SOCKET>(socket_)), nullptr);
++    }
++#else
++    if (socket_ >= 0) {
++        ::shutdown(socket_, SHUT_RDWR);
++    }
++#endif
++}
+ 
+ } // namespace sonocontrol
