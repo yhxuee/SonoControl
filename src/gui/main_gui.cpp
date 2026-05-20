@@ -792,8 +792,11 @@ private slots:
 
     void onTemperature(double t1, double t2) {
         touchWorkerSignal();
-        const bool has_t1 = (t1 > 0);
-        const bool has_t2 = (t2 > 0);
+        // The worker sends NaN (not 0.0) when a channel is not connected, so
+        // use isnan() here rather than t1 > 0 (which would wrongly treat an
+        // exact 0 °C reading as "disconnected" if min_plausible_temp_c < 0).
+        const bool has_t1 = !std::isnan(t1);
+        const bool has_t2 = !std::isnan(t2);
         lblT1_->setText(has_t1 ? QString::number(t1, 'f', 1) + QString::fromUtf8("°C") : "N/C");
         lblT2_->setText(has_t2 ? QString::number(t2, 'f', 1) + QString::fromUtf8("°C") : "N/C");
 
@@ -1030,7 +1033,10 @@ private slots:
             if (sim) sensor = std::make_unique<sonocontrol::TemperatureSimulator>();
             else sensor = std::make_unique<sonocontrol::HH806AUSensor>(cmbCom11_->currentData().toString().toStdString(), 10.0, 80.0, 15.0);
             // Retry up to 3 times — HH806AU often ignores the first request
-            // after a fresh port open. Give the device 150ms to warm up.
+            // after a fresh port open. Give the device 150 ms to warm up.
+            // Note: this blocks the GUI thread for up to ~1.2 s total
+            // (3 × ~360 ms sensor poll + 2 × 150 ms sleep). Acceptable for a
+            // user-triggered manual test but should not be called in a loop.
             std::optional<double> t1, t2;
             for (int attempt = 0; attempt < 3; ++attempt) {
                 if (attempt > 0) QThread::msleep(150);
@@ -1637,6 +1643,11 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         v->addStretch(); return w;
     }
 
+    // buildExportPanel() is an alternative compact layout kept for reference.
+    // It is NOT called from buildUi() — the buttons it contains are available
+    // via the menu bar. Do NOT assign lblConfigStatus_ here: that pointer is
+    // already owned by buildLeftPanel(), and a second assignment would orphan
+    // the first widget and break all updateConfigStatus() calls.
     QWidget* buildExportPanel() {
         auto* grp = new QGroupBox("Config / Export / Logs");
         auto* g = new QGridLayout(grp);
@@ -1652,13 +1663,13 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         connect(csv, &QPushButton::clicked, this, &SonoControlWindow::exportCsv);
         connect(graph, &QPushButton::clicked, this, &SonoControlWindow::exportGraph);
         connect(logs, &QPushButton::clicked, this, &SonoControlWindow::openLogs);
-        lblConfigStatus_ = new QLabel("Config: GUI defaults");
-        lblConfigStatus_->setWordWrap(true);
-        lblConfigStatus_->setStyleSheet("color:#667085; font-size:12px;");
+        auto* statusLbl = new QLabel("Config: GUI defaults");
+        statusLbl->setWordWrap(true);
+        statusLbl->setStyleSheet("color:#667085; font-size:12px;");
         g->addWidget(load,0,0); g->addWidget(save,0,1);
         g->addWidget(templ,1,0); g->addWidget(logs,1,1);
         g->addWidget(csv,2,0); g->addWidget(graph,2,1);
-        g->addWidget(lblConfigStatus_,3,0,1,2);
+        g->addWidget(statusLbl,3,0,1,2);
         return grp;
     }
 
@@ -1766,7 +1777,14 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         }
 #endif
         out.removeDuplicates();
+#ifndef _WIN32
+        // On Windows the port list is already sorted numerically (COM3, COM5,
+        // COM10 …) by the std::sort at the end of the WIN32 block above.
+        // Applying Qt's lexicographic sort here would overwrite that order and
+        // produce COM10 < COM3. Only apply it on non-Windows where the ports
+        // are ttyUSB* / ttyACM* strings that sort naturally as text.
         out.sort();
+#endif
         return out;
     }
 

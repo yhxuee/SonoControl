@@ -10,6 +10,7 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -249,7 +250,9 @@ int ExperimentRunner::run() {
                     const double dt_predict = std::max(0.001, std::chrono::duration<double>(now - previous_temp_sample_time).count());
                     previous_temp_sample_time = now;
                     previous_filtered_control_temp = filtered_control_temp;
-                    const double alpha = 0.25;
+                    // α=0.25 single-pole IIR: smooths 2 Hz samples without
+                    // introducing more than ~2 sample lag at typical heating rates.
+                    constexpr double alpha = 0.25;
                     filtered_control_temp = filtered_control_temp + alpha * (avg - filtered_control_temp);
                     control_rate_c_per_s = (filtered_control_temp - previous_filtered_control_temp) / dt_predict;
                     control_rate_c_per_s = std::clamp(control_rate_c_per_s, -0.20, 0.20);
@@ -266,8 +269,11 @@ int ExperimentRunner::run() {
                     predicted_control_temp = control_temp_filtered + prediction_tau_s * control_rate_c_per_s * response_fraction;
                 }
 
-                const double out_t1 = t1 ? *t1 : 0.0;
-                const double out_t2 = t2 ? *t2 : 0.0;
+                // Use NaN (not 0.0) as the "not connected" sentinel so that the
+                // GUI's isnan() check works correctly even if a probe happens
+                // to read exactly 0 °C (possible when min_plausible_temp_c < 0).
+                const double out_t1 = t1 ? *t1 : std::numeric_limits<double>::quiet_NaN();
+                const double out_t2 = t2 ? *t2 : std::numeric_limits<double>::quiet_NaN();
                 const std::string s_t1 = t1 ? (fmt_double(*t1, 2) + " C") : std::string("N/C");
                 const std::string s_t2 = t2 ? (fmt_double(*t2, 2) + " C") : std::string("N/C");
                 log_console("TEMP  T1=" + s_t1 + "  T2=" + s_t2 + "  CTRL=" + fmt_double(avg, 2) + " C [" + active_channel + "]" +
@@ -579,8 +585,12 @@ void ExperimentRunner::send_stop() {
     try {
         const int repeats = std::max(1, config_.emergency_stop_repeats);
         for (int i = 0; i < repeats; ++i) {
-            // Do not allow request_stop() to suppress STOP packets. Manual or
-            // error stops must still transmit the hardware stop command.
+            // Temporarily clear stop_flag_ so com_write() does not bail out
+            // before the hardware STOP packet is transmitted. The flag is
+            // restored afterwards. Note: force_stop() from the GUI thread can
+            // race with this load/clear/restore sequence. The only observable
+            // consequence of the race is that the post-stop return code may be
+            // 0 instead of 3 — the hardware STOP is always sent either way.
             const bool was_stop = stop_flag_.load();
             stop_flag_ = false;
             com_write(protocol::pkt_stop(), "STOP");

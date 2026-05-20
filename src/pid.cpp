@@ -33,6 +33,12 @@ double PIDController::compute(double setpoint, double measured) {
     prev_error_ = error;
 
     const double raw = kp_ * error + ki_ * integral_ + kd_ * derivative;
+    // +0.5 biases the demand to mid-scale (50 % power) when the PID terms sum
+    // to zero. Without it, a freshly-reset controller at setpoint would start
+    // at demand=0 and only ramp up via integral wind-up, causing a visible
+    // temperature dip at cycle boundaries. The bias ensures the system
+    // maintains roughly half power as a starting point even before the
+    // integral has time to track the true steady-state load.
     return std::clamp(raw + 0.5, 0.0, 1.0);
 }
 
