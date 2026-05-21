@@ -44,11 +44,11 @@ The project provides:
 > **ABI warning**: Qt and the compiler must share the same ABI. Do not mix an MSVC Qt build with a MinGW compiler or vice versa. CMake will print a fatal error if it detects the mismatch.
 
 ### Hardware
-| Device | Connection | Purpose |
-|--------|-----------|---------|
+| Device          | Connection | Purpose |
+|-----------------|-----------|---------|
 | Ultrasound FPGA | COM3 (9600 8N1) | Receives serial control packets |
 | Ultrasound FPGA | UDP target (default `192.168.0.2:5000`) | Receives 4096-sample waveform table |
-| Mastech HH806AU | COM5 (19200 8E1) | Dual-channel thermocouple readout |
+| Omega HH806AU   | COM5 (19200 8E1) | Dual-channel thermocouple readout |
 
 All port names, baud rates, and the UDP target are configurable.
 
