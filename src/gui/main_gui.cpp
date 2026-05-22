@@ -22,8 +22,11 @@
 #include <QtCore/QThread>
 #include <QtCore/QRegularExpression>
 #include <QtCore/QTimer>
+#include <QtGui/QClipboard>
 #include <QtGui/QCloseEvent>
 #include <QtGui/QDesktopServices>
+#include <QtGui/QIntValidator>
+#include <QtGui/QKeyEvent>
 #include <QtGui/QPainter>
 #include <QtGui/QPen>
 #include <QtGui/QPixmap>
@@ -198,14 +201,13 @@ public:
     void setLines(double setpoint, double cutoff) { setpoint_ = setpoint; cutoff_ = cutoff; scheduleRepaint(); }
     void append(double t, double t1, double t2, double avg) {
         times_.push_back(t); t1_.push_back(t1); t2_.push_back(t2); avg_.push_back(avg);
-        constexpr size_t kMaxPlotPoints = 6000;
-        constexpr size_t kTrimPlotPoints = 600;
-        if (times_.size() > kMaxPlotPoints) {
-            times_.erase(times_.begin(), times_.begin() + kTrimPlotPoints);
-            t1_.erase(t1_.begin(), t1_.begin() + kTrimPlotPoints);
-            t2_.erase(t2_.begin(), t2_.begin() + kTrimPlotPoints);
-            avg_.erase(avg_.begin(), avg_.begin() + kTrimPlotPoints);
-        }
+        // Keep every sample for the full experiment so long runs do not lose
+        // history. The painter already downsamples to ~1200 points for drawing
+        // (see `step` in paintEvent), so memory — not draw time — is the only
+        // cost of holding the full series. At 2 Hz that is ~173 k samples per
+        // 24 h, ≈ 5.5 MB across the four vectors. Importing a CSV log relies
+        // on this too: previously the buffer cap silently dropped older rows
+        // and only the tail of the file was plotted.
         scheduleRepaint();
     }
 private:
@@ -361,6 +363,139 @@ protected:
     }
 private:
     std::vector<float> data_;
+};
+
+// Apple-style PIN code entry: a row of N separate digit boxes (visible
+// digits, no echo masking). Each box accepts one digit; entering one auto-
+// advances focus to the next; Backspace on an empty box jumps back and
+// clears the previous digit; arrow keys navigate; paste fills as many
+// boxes as the clipboard provides. Two sizes — compact for inline forms
+// (preflight) and "large" for the stop confirmation dialog.
+class PinEntry final : public QWidget {
+    Q_OBJECT
+public:
+    explicit PinEntry(int digits, bool large, QWidget* parent = nullptr)
+        : QWidget(parent) {
+        auto* h = new QHBoxLayout(this);
+        h->setContentsMargins(0, 0, 0, 0);
+        h->setSpacing(large ? 12 : 8);
+        h->setAlignment(Qt::AlignCenter);
+        boxes_.reserve(static_cast<size_t>(digits));
+        const int side = large ? 64 : 40;
+        const int radius = large ? 14 : 10;
+        const int fontPx = large ? 32 : 22;
+        const QString style = QString(
+            "QLineEdit { background:#ffffff; color:#101828; border:1px solid #d0d5dd; "
+            "border-radius:%1px; padding:0; min-width:%2px; max-width:%2px; "
+            "min-height:%2px; max-height:%2px; font-size:%3px; font-weight:600; }"
+            "QLineEdit:focus { border:2px solid #00897b; }"
+            "QLineEdit:disabled { background:#f3f5f8; color:#98a2b3; }"
+        ).arg(radius).arg(side).arg(fontPx);
+        for (int i = 0; i < digits; ++i) {
+            auto* e = new QLineEdit;
+            e->setMaxLength(1);
+            e->setValidator(new QIntValidator(0, 9, e));
+            e->setAlignment(Qt::AlignCenter);
+            e->setStyleSheet(style);
+            // Visible digits — explicitly NOT password mode. Operators
+            // and the lab partner standing next to them both need to see
+            // the digits when shouting the PIN across the bench.
+            e->setEchoMode(QLineEdit::Normal);
+            e->installEventFilter(this);
+            connect(e, &QLineEdit::textChanged, this, [this, i](const QString& s) { onTextChanged(i, s); });
+            h->addWidget(e);
+            boxes_.push_back(e);
+        }
+    }
+
+    QString pin() const {
+        QString s;
+        for (auto* b : boxes_) s += b->text();
+        return s;
+    }
+
+    void clearPin() {
+        for (auto* b : boxes_) b->clear();
+        focusFirst();
+    }
+
+    void setFromString(const QString& src) {
+        for (auto* b : boxes_) b->clear();
+        int wrote = 0;
+        for (int i = 0; i < src.size() && wrote < static_cast<int>(boxes_.size()); ++i) {
+            if (src[i].isDigit()) {
+                boxes_[static_cast<size_t>(wrote)]->setText(QString(src[i]));
+                ++wrote;
+            }
+        }
+        if (wrote < static_cast<int>(boxes_.size())) {
+            boxes_[static_cast<size_t>(wrote)]->setFocus();
+        } else if (!boxes_.empty()) {
+            boxes_.back()->setFocus();
+        }
+    }
+
+    void focusFirst() {
+        for (auto* b : boxes_) {
+            if (b->text().isEmpty()) { b->setFocus(); return; }
+        }
+        if (!boxes_.empty()) boxes_.back()->setFocus();
+    }
+
+    void setEntryEnabled(bool on) {
+        for (auto* b : boxes_) b->setEnabled(on);
+    }
+
+signals:
+    void changed();
+    // Emitted once when the final digit completes the code. Useful for
+    // auto-submit, but the dialog still requires an explicit OK click to
+    // commit so a mistyped digit can be corrected before submission.
+    void completed(const QString& pin);
+
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override {
+        if (event->type() == QEvent::KeyPress) {
+            auto* ke = static_cast<QKeyEvent*>(event);
+            for (size_t i = 0; i < boxes_.size(); ++i) {
+                if (watched != boxes_[i]) continue;
+                if (ke->key() == Qt::Key_Backspace && boxes_[i]->text().isEmpty() && i > 0) {
+                    boxes_[i - 1]->setFocus();
+                    boxes_[i - 1]->clear();
+                    return true;
+                }
+                if (ke->key() == Qt::Key_Left && i > 0) {
+                    boxes_[i - 1]->setFocus();
+                    return true;
+                }
+                if (ke->key() == Qt::Key_Right && i + 1 < boxes_.size()) {
+                    boxes_[i + 1]->setFocus();
+                    return true;
+                }
+                if (ke->matches(QKeySequence::Paste)) {
+                    setFromString(QApplication::clipboard()->text());
+                    return true;
+                }
+                break;
+            }
+        }
+        return QWidget::eventFilter(watched, event);
+    }
+
+private:
+    void onTextChanged(int i, const QString& s) {
+        if (!s.isEmpty() && i + 1 < static_cast<int>(boxes_.size())) {
+            boxes_[static_cast<size_t>(i) + 1]->setFocus();
+            boxes_[static_cast<size_t>(i) + 1]->selectAll();
+        }
+        emit changed();
+        const QString full = pin();
+        if (full.size() == static_cast<int>(boxes_.size())) {
+            emit completed(full);
+        }
+    }
+
+    std::vector<QLineEdit*> boxes_;
 };
 
 class RunnerWorker final : public QObject {
@@ -660,9 +795,14 @@ private slots:
     }
 
     void onStop() {
+        if (!worker_) return;
+        if (pendingPinEnabled_ && !promptForStopPin()) {
+            appendConsole(">>> Manual stop cancelled (PIN not confirmed)");
+            statusBar()->showMessage("Manual stop cancelled");
+            return;
+        }
         appendConsole(">>> EMERGENCY STOP requested");
         statusBar()->showMessage("Emergency stop requested");
-        if (!worker_) return;
         worker_->stop();
         // Visually mark the button as already pressed and disable a second
         // graceful click — the next click should be the user explicitly
@@ -687,9 +827,81 @@ private slots:
     // graceful attempt timed out — at this point we go straight to force_stop.
     void onForceStop() {
         if (!worker_) return;
+        if (pendingPinEnabled_ && !promptForStopPin()) {
+            appendConsole(">>> Force-stop cancelled (PIN not confirmed)");
+            statusBar()->showMessage("Force-stop cancelled");
+            return;
+        }
         appendConsole(">>> User requested force-stop");
         worker_->forceStop();
         btnStop_->setEnabled(false);
+    }
+
+    // Opens a modal prompt that shows the current operator name and demands
+    // the 4-digit PIN configured at preflight. Returns true only on an exact
+    // match. The 2 s graceful->force escalation and the watchdog do not call
+    // this — they bypass the PIN so safety paths cannot be locked out.
+    bool promptForStopPin() {
+        QDialog dlg(this);
+        dlg.setWindowTitle("Confirm Manual Stop");
+        dlg.setModal(true);
+        dlg.setMinimumWidth(440);
+        auto* v = new QVBoxLayout(&dlg);
+        v->setContentsMargins(36, 28, 36, 22);
+        v->setSpacing(14);
+
+        auto* title = new QLabel("Stop experiment?");
+        title->setAlignment(Qt::AlignCenter);
+        title->setStyleSheet("font-size:22px; font-weight:700;");
+        v->addWidget(title);
+
+        auto* who = new QLabel(QString("Current user: <b>%1</b>").arg(pendingPinUsername_.toHtmlEscaped()));
+        who->setTextFormat(Qt::RichText);
+        who->setAlignment(Qt::AlignCenter);
+        who->setStyleSheet("font-size:14px; color:#344054;");
+        v->addWidget(who);
+
+        auto* prompt = new QLabel("Enter the 4-digit PIN to stop the experiment");
+        prompt->setAlignment(Qt::AlignCenter);
+        prompt->setStyleSheet("font-size:13px; color:#475467;");
+        v->addWidget(prompt);
+
+        v->addSpacing(4);
+        auto* pinEntry = new PinEntry(4, /*large=*/true);
+        v->addWidget(pinEntry, 0, Qt::AlignCenter);
+
+        auto* err = new QLabel(" ");
+        err->setAlignment(Qt::AlignCenter);
+        err->setStyleSheet("color:#d93025; font-size:12px; min-height:18px;");
+        v->addWidget(err);
+
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+        auto* okBtn = buttons->button(QDialogButtonBox::Ok);
+        okBtn->setText("Stop");
+        okBtn->setEnabled(false);
+        v->addWidget(buttons);
+
+        // Enable Stop only when all four digits are present.
+        connect(pinEntry, &PinEntry::changed, okBtn, [pinEntry, okBtn, err]() {
+            okBtn->setEnabled(pinEntry->pin().size() == 4);
+            err->setText(" ");
+        });
+        // Pressing the last digit submits via the same path as clicking Stop.
+        connect(pinEntry, &PinEntry::completed, okBtn, [okBtn]() {
+            if (okBtn->isEnabled()) okBtn->animateClick();
+        });
+
+        connect(buttons, &QDialogButtonBox::accepted, &dlg, [&, pinEntry, err]() {
+            if (pinEntry->pin() != pendingPin_) {
+                err->setText("Incorrect PIN.");
+                pinEntry->clearPin();
+                return;
+            }
+            dlg.accept();
+        });
+        connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        pinEntry->focusFirst();
+        return dlg.exec() == QDialog::Accepted;
     }
 
     void loadConfigFile() {
@@ -786,6 +998,10 @@ private slots:
         if (code == 0) {
             lastAutoSaveDir_ = autosaveExperimentArtifacts();
         }
+        // Drop the manual-stop PIN so it does not leak across runs.
+        pendingPinEnabled_ = false;
+        pendingPinUsername_.clear();
+        pendingPin_.clear();
         showExperimentSummary(code);
         // idleTimer_ no longer used
     }
@@ -1099,18 +1315,28 @@ private slots:
             QMessageBox::warning(this, "Import Error", "CSV file has no data rows.");
             return;
         }
+        // Header is read by name (not by position) so both the legacy schema
+        // and the extended schema (with phase/setpoint_C/pid_demand_pct/
+        // us_active appended at the end) are accepted unchanged: extra
+        // columns are simply ignored, and a setpoint column is honoured for
+        // the dashed reference line if it exists.
         const QStringList header = lines.first().split(',');
         auto idx = [&](const QString& name) { return header.indexOf(name); };
         const int iTime = idx("time_s");
         const int iT1 = idx("T1_C");
         const int iT2 = idx("T2_C");
         const int iTemp = idx("temp_C");
+        const int iSetpoint = idx("setpoint_C");  // -1 on legacy CSVs
         if (iTime < 0 || iTemp < 0) {
             QMessageBox::warning(this, "Import Error", "CSV must contain at least time_s and temp_C columns.");
             return;
         }
         tempPlot_->clear();
-        tempPlot_->setLines(spnSetpoint_->value(), spnCutoff_->value());
+        // Pick up the recorded setpoint for the dashed reference line so the
+        // plot reflects the imported run instead of whatever the GUI happens
+        // to have configured right now. The cutoff temperature is not a
+        // per-sample column in either schema — keep the live GUI value for it.
+        double importedSetpoint = std::numeric_limits<double>::quiet_NaN();
         int count = 0;
         for (int r = 1; r < lines.size(); ++r) {
             const QStringList cols = lines[r].split(',');
@@ -1122,10 +1348,22 @@ private slots:
             if (iT1 >= 0 && cols.size() > iT1) t1 = cols[iT1].trimmed().toDouble(&okT1);
             if (iT2 >= 0 && cols.size() > iT2) t2 = cols[iT2].trimmed().toDouble(&okT2);
             if (!okTime || !okTemp) continue;
+            if (iSetpoint >= 0 && cols.size() > iSetpoint && std::isnan(importedSetpoint)) {
+                bool okSp = false;
+                const double sp = cols[iSetpoint].trimmed().toDouble(&okSp);
+                if (okSp) importedSetpoint = sp;
+            }
             tempPlot_->append(ts, okT1 ? t1 : 0.0, okT2 ? t2 : 0.0, temp);
             ++count;
         }
-        appendConsole(QString("Imported log for plotting: %1 (%2 samples)").arg(path).arg(count));
+        // Apply the reference line AFTER the loop so the imported setpoint
+        // (if any) replaces the GUI value; otherwise fall back to GUI.
+        tempPlot_->setLines(std::isnan(importedSetpoint) ? spnSetpoint_->value() : importedSetpoint,
+                            spnCutoff_->value());
+        appendConsole(QString("Imported log for plotting: %1 (%2 samples%3)")
+                          .arg(path)
+                          .arg(count)
+                          .arg(std::isnan(importedSetpoint) ? QString() : QString(", setpoint=%1°C").arg(importedSetpoint, 0, 'f', 2)));
         statusBar()->showMessage(QString("Imported %1 samples from log").arg(count));
     }
 
@@ -1140,16 +1378,151 @@ private slots:
     }
 
     void showReadme() {
-        QMessageBox::information(this, "SonoControl Readme",
-            "PID parameters\n\n"
-            "Kp: proportional gain. Higher Kp reacts more strongly to temperature error. Increase if the system is too slow; decrease if it overshoots or oscillates.\n\n"
-            "Ki: integral gain. It removes long-term offset, but too much Ki causes delayed overshoot. For 1 mL wells, start very small or zero.\n\n"
-            "Kd: derivative gain. It suppresses rapid temperature rise. Too much Kd can make output noisy or overly conservative.\n\n"
-            "Tau: liquid thermal time constant used by the prediction model T_future = T + tau*dT/dt*(1-exp(-t1/tau)). Larger tau brakes earlier; smaller tau behaves closer to ordinary PID. Tau=0 disables prediction.\n\n"
-            "CONNECT page\n\n"
-            "Scan Ports refreshes available serial ports. COM3 is the ultrasound controller port. UDP Host and UDP Port are the waveform target. The HH806AU section connects the temperature meter; select T1, T2, or Average. Use Test before running PID. Temperature monitoring is required for PID and after-target hold mode.\n\n"
-            "Configuration\n\n"
-            "Use File > Load Configuration and File > Save Configuration for .config files. Edit > Set Auto-save Directory stores the default completed-experiment output folder in the .config file. File > Import Log File loads a CSV log and redraws the temperature plot.");
+        QDialog dlg(this);
+        dlg.setWindowTitle("SonoControl — Readme");
+        dlg.setModal(true);
+        dlg.resize(720, 640);
+        auto* layout = new QVBoxLayout(&dlg);
+
+        auto* title = new QLabel("SonoControl quick reference");
+        title->setStyleSheet("font-size:18px; font-weight:700;");
+        layout->addWidget(title);
+
+        auto* body = new QPlainTextEdit;
+        body->setReadOnly(true);
+        body->setStyleSheet("font-family:'Segoe UI',Arial,sans-serif; font-size:13px;");
+        body->setPlainText(
+            "PID parameters\n"
+            "──────────────\n"
+            "Kp  Proportional gain. Higher = stronger reaction to error. Raise if response is too slow; lower if it overshoots or oscillates.\n"
+            "Ki  Integral gain. Removes long-term offset; too much causes delayed overshoot. For small (≈1 mL) wells start at zero or near-zero.\n"
+            "Kd  Derivative gain. Suppresses rapid rises; too much makes output noisy.\n"
+            "Thermal const (tau)  Liquid time constant for the predictive model T_future = T + τ·dT/dt·(1 − e^(−t/τ)). Larger τ brakes earlier; τ = 0 disables prediction.\n"
+            "Prediction horizon  Lookahead in seconds. 0 = use the current hardware interval.\n"
+            "\n"
+            "Experiment length modes\n"
+            "───────────────────────\n"
+            "Total Duration    Wall-clock minutes; supports temperature cycling.\n"
+            "Repeating Cycles  Fixed number of burst-interval cycles. Disabled when PID is enabled.\n"
+            "After-target Hold Starts the hold timer the first time the channel temperature reaches setpoint ± tolerance. Requires temperature monitoring.\n"
+            "\n"
+            "Cycling (Total Duration mode only)\n"
+            "──────────────────────────────────\n"
+            "Heating / Cooling phases are entered in minutes. Each phase is capped at the configured Total Duration. Cooling mode is either Stop (ultrasound off) or Hold (PID maintains a lower setpoint).\n"
+            "\n"
+            "Manual-stop PIN protection\n"
+            "──────────────────────────\n"
+            "The Preflight Confirmation dialog has an optional username + 4-digit PIN. When enabled, the manual STOP button asks for the PIN before stopping. The 2-second force-stop escalation and the stall watchdog still bypass the prompt so safety paths cannot be locked out.\n"
+            "\n"
+            "CONNECT tab\n"
+            "───────────\n"
+            "Scan Ports refreshes serial port discovery. COM3 = ultrasound controller, UDP host/port = waveform target. The HH806AU section connects the dual-channel thermocouple meter; pick T1, T2, or Average. Use Test before running PID. Temperature monitoring is mandatory for PID and After-target Hold.\n"
+            "\n"
+            "Configuration files\n"
+            "───────────────────\n"
+            "File → Save Configuration / Load Configuration use a UTF-8 .config file. Edit → Set Auto-save Directory stores the default completed-experiment output folder. File → Import Log File loads a CSV log and redraws the temperature plot, picking up the recorded setpoint as the reference line when present.\n"
+            "\n"
+            "Logging\n"
+            "───────\n"
+            "Streaming CSV log per session under ./logs/<timestamp>_log.csv; metadata JSON next to it; auto-saved bundle under ./experiments/<session>/ (or your configured auto-save directory) on clean completion. The HH806AU raw log rotates daily as hh806au_raw_YYYYMMDD.log."
+        );
+        layout->addWidget(body, 1);
+
+        auto* close = new QDialogButtonBox(QDialogButtonBox::Close);
+        connect(close, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        connect(close, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        layout->addWidget(close);
+        dlg.exec();
+    }
+
+    void showAboutDialog() {
+        QDialog dlg(this);
+        dlg.setWindowTitle("About SonoControl");
+        dlg.setModal(true);
+        dlg.resize(620, 640);
+        auto* layout = new QVBoxLayout(&dlg);
+        layout->setContentsMargins(20, 20, 20, 16);
+        layout->setSpacing(10);
+
+        auto* name = new QLabel("SonoControl");
+        name->setStyleSheet("font-size:24px; font-weight:800;");
+        layout->addWidget(name);
+
+        auto* tagline = new QLabel("Ultrasound thermal controller — desktop application driving an FPGA ultrasound device with PID-regulated temperature feedback.");
+        tagline->setWordWrap(true);
+        tagline->setStyleSheet("font-size:13px; color:#475467;");
+        layout->addWidget(tagline);
+
+        auto* versionRow = new QLabel(QString("Version %1   ·   Qt %2   ·   %3 build")
+            .arg(QApplication::applicationVersion())
+            .arg(qstr(qVersion()))
+            .arg(debug_sim_build() ? "Debug (simulation enabled)" : "Release"));
+        versionRow->setStyleSheet("font-size:12px; color:#667085;");
+        layout->addWidget(versionRow);
+
+        auto* sep1 = new QFrame; sep1->setFrameShape(QFrame::HLine); sep1->setStyleSheet("color:#e4e7ec;");
+        layout->addWidget(sep1);
+
+        auto* sectionsLbl = new QLabel("What's in this build");
+        sectionsLbl->setStyleSheet("font-size:14px; font-weight:700; letter-spacing:0.4px;");
+        layout->addWidget(sectionsLbl);
+
+        auto* body = new QPlainTextEdit;
+        body->setReadOnly(true);
+        body->setStyleSheet("font-family:'Segoe UI',Arial,sans-serif; font-size:12px;");
+        body->setPlainText(
+            "Experiment control\n"
+            "  • Ultrasound amplitude, carrier frequency, PRF, duty cycle, duration, interval\n"
+            "  • Sine / square / triangle waveforms over a 4096-sample DDS table (UDP)\n"
+            "  • Length modes: Total Duration, Repeating Cycles, After-target Hold\n"
+            "  • Temperature cycling (heating / cooling, in minutes, capped at total duration)\n"
+            "  • PID with predictive thermal model T_future = T + τ·dT/dt·(1 − e^(−t/τ))\n"
+            "  • Configurable safety cutoff with debounce (N samples, min spacing)\n"
+            "\n"
+            "Hardware\n"
+            "  • Ultrasound FPGA: COM3 9600 8N1 control + UDP 4096-sample waveform table\n"
+            "  • Omega HH806AU dual-channel thermocouple meter: COM5 19200 8E1\n"
+            "  • Persistent COM3, exponential-backoff retry, force-stop cancels pending I/O\n"
+            "\n"
+            "Safety & operations\n"
+            "  • Manual-stop PIN protection (username + 4-digit PIN, per-run)\n"
+            "  • Stall watchdog: auto-escalates to force-stop after configurable timeout\n"
+            "  • Status pills (COM3 / UDP / Temp) updated by a background probe — never blocks the UI\n"
+            "  • Auto-theme: dark mode 17:00–08:00 by default\n"
+            "\n"
+            "Logging\n"
+            "  • Streaming CSV per session with per-sample columns: T1, T2, temperature,\n"
+            "    full ultrasound params, plus phase, setpoint, PID demand %, US active\n"
+            "  • Metadata JSON with bounded event/error ring (no unbounded growth)\n"
+            "  • HH806AU raw diagnostic log rotates daily and coalesces repeats\n"
+            "  • CSV import accepts both the new schema and the legacy schema\n"
+            "\n"
+            "Long-run optimizations in this build\n"
+            "  • Plot retains the full session — paint downsamples for display\n"
+            "  • Cached UDP destination and waveform preview avoid per-packet rebuilds\n"
+            "  • Larger CSV streambuf and decoupled meta-rewrite cadence\n"
+            "  • Errors flush CSV and metadata immediately\n"
+            "\n"
+            "Credits\n"
+            "  • SonoControl is provided as-is for research use.\n"
+            "  • Built with Qt Widgets, C++17, CMake."
+        );
+        layout->addWidget(body, 1);
+
+        auto* pathsLbl = new QLabel(QString("Logs folder:   %1\nAuto-save:     %2")
+            .arg(qstr(logger_.log_dir().string()))
+            .arg(autoSaveDir_.isEmpty() ? QString("(default ./experiments/<session>)") : autoSaveDir_));
+        pathsLbl->setStyleSheet("font-family:Consolas,monospace; font-size:11px; color:#475467;");
+        pathsLbl->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        layout->addWidget(pathsLbl);
+
+        auto* btns = new QDialogButtonBox(QDialogButtonBox::Close);
+        auto* openLogsBtn = btns->addButton("Open Log Folder", QDialogButtonBox::ActionRole);
+        connect(openLogsBtn, &QPushButton::clicked, this, &SonoControlWindow::openLogs);
+        connect(btns, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        connect(btns, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        layout->addWidget(btns);
+        dlg.exec();
     }
 
     void toggleConsole(bool v) { consoleFrame_->setVisible(v); }
@@ -1471,7 +1844,12 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 
         auto* about = menuBar()->addMenu("About");
         auto* actReadme = about->addAction("Readme");
+        auto* actAbout = about->addAction("About SonoControl...");
+        about->addSeparator();
+        auto* actOpenLogs = about->addAction("Open Log Folder");
         connect(actReadme, &QAction::triggered, this, &SonoControlWindow::showReadme);
+        connect(actAbout, &QAction::triggered, this, &SonoControlWindow::showAboutDialog);
+        connect(actOpenLogs, &QAction::triggered, this, &SonoControlWindow::openLogs);
     }
 
     void buildUi() {
@@ -1612,11 +1990,30 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 
     QWidget* buildCycleTab() {
         auto* w = new QWidget; auto* v = new QVBoxLayout(w); v->setSpacing(12); v->setContentsMargins(12,14,12,14);
-        auto* en = new QGroupBox("Temperature Cycling"); auto* ev = new QVBoxLayout(en); chkCycling_ = new QCheckBox("Enable Heating / Cooling Cycles"); ev->addWidget(chkCycling_); auto* cycleNote = new QLabel("Available only in Total Duration mode. Phase durations are fixed wall-clock durations for long-run stability."); cycleNote->setWordWrap(true); cycleNote->setStyleSheet("color:#667085; font-size:12px;"); ev->addWidget(cycleNote); v->addWidget(en);
-        auto* heat = new QGroupBox("Heating Phase"); auto* hh = new QHBoxLayout(heat); spnHeatS_ = dspin(1.0,86400.0,60.0,0,5.0); hh->addWidget(new QLabel("Duration")); hh->addWidget(spnHeatS_); hh->addWidget(new QLabel("s")); v->addWidget(heat);
-        auto* cool = new QGroupBox("Cooling Phase"); auto* cv = new QVBoxLayout(cool); auto* cr = new QHBoxLayout; spnCoolS_ = dspin(1.0,86400.0,30.0,0,5.0); cr->addWidget(new QLabel("Duration")); cr->addWidget(spnCoolS_); cr->addWidget(new QLabel("s")); cv->addLayout(cr);
+        auto* en = new QGroupBox("Temperature Cycling"); auto* ev = new QVBoxLayout(en); chkCycling_ = new QCheckBox("Enable Heating / Cooling Cycles"); ev->addWidget(chkCycling_); auto* cycleNote = new QLabel("Available only in Total Duration mode. Each phase is capped at the total duration."); cycleNote->setWordWrap(true); cycleNote->setStyleSheet("color:#667085; font-size:12px;"); ev->addWidget(cycleNote); v->addWidget(en);
+        // Phase durations are entered in minutes. The underlying Config struct
+        // still stores seconds (`heating_s`, `cooling_s`) so the experiment
+        // loop and existing .config files keep working unchanged — conversion
+        // happens at buildConfig() / applyConfigToUi().
+        const double initial_total_min = spnTotalDur_ ? spnTotalDur_->value() : 60.0;
+        spnHeatS_ = dspin(0.05, initial_total_min, 1.0, 2, 0.5);
+        spnCoolS_ = dspin(0.05, initial_total_min, 0.5, 2, 0.5);
+        auto* heat = new QGroupBox("Heating Phase"); auto* hh = new QHBoxLayout(heat); hh->addWidget(new QLabel("Duration")); hh->addWidget(spnHeatS_); hh->addWidget(new QLabel("min")); v->addWidget(heat);
+        auto* cool = new QGroupBox("Cooling Phase"); auto* cv = new QVBoxLayout(cool); auto* cr = new QHBoxLayout; cr->addWidget(new QLabel("Duration")); cr->addWidget(spnCoolS_); cr->addWidget(new QLabel("min")); cv->addLayout(cr);
         rbCoolStop_ = new QRadioButton("Stop ultrasound"); rbCoolLow_ = new QRadioButton("Hold at temperature (PID)"); rbCoolStop_->setChecked(true); auto* bg = new QButtonGroup(this); bg->addButton(rbCoolStop_); bg->addButton(rbCoolLow_); cv->addWidget(rbCoolStop_); cv->addWidget(rbCoolLow_);
-        auto* hold = new QGroupBox("Hold Temperature"); auto* hv = new QHBoxLayout(hold); spnCoolHoldTemp_ = dspin(20.0,45.0,37.0,1,0.5); hv->addWidget(new QLabel("Target")); hv->addWidget(spnCoolHoldTemp_); hv->addWidget(new QLabel(QString::fromUtf8("°C"))); cv->addWidget(hold); v->addWidget(cool); v->addStretch(); return w;
+        auto* hold = new QGroupBox("Hold Temperature"); auto* hv = new QHBoxLayout(hold); spnCoolHoldTemp_ = dspin(20.0,45.0,37.0,1,0.5); hv->addWidget(new QLabel("Target")); hv->addWidget(spnCoolHoldTemp_); hv->addWidget(new QLabel(QString::fromUtf8("°C"))); cv->addWidget(hold); v->addWidget(cool); v->addStretch();
+        // Keep the phase caps in sync with total duration as the user edits it.
+        if (spnTotalDur_) {
+            connect(spnTotalDur_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, &SonoControlWindow::updateCyclePhaseCaps);
+        }
+        return w;
+    }
+
+    void updateCyclePhaseCaps() {
+        if (!spnTotalDur_ || !spnHeatS_ || !spnCoolS_) return;
+        const double cap = std::max(spnHeatS_->minimum(), spnTotalDur_->value());
+        spnHeatS_->setMaximum(cap);
+        spnCoolS_->setMaximum(cap);
     }
 
     QWidget* buildConnTab() {
@@ -1994,7 +2391,7 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         QDialog dlg(this);
         dlg.setWindowTitle("Preflight Confirmation");
         dlg.setModal(true);
-        dlg.resize(840, 720);
+        dlg.resize(840, 780);
         auto* layout = new QVBoxLayout(&dlg);
         auto* title = new QLabel("Review settings before starting");
         title->setStyleSheet("font-size:18px; font-weight:700;");
@@ -2005,6 +2402,50 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         summary->setPlainText(configSummary(cfg));
         summary->setStyleSheet("font-family:Consolas,monospace; font-size:12px;");
         layout->addWidget(summary, 1);
+
+        // Session-scoped manual-stop PIN. Independent of any persisted config —
+        // intentionally re-entered for every run so a stale PIN from a previous
+        // operator can't block a hand-off. The PIN gates the manual STOP button
+        // only; the watchdog and force-stop escalation always proceed.
+        auto* lockGrp = new QGroupBox("Manual-stop PIN protection");
+        auto* lockGrid = new QGridLayout(lockGrp);
+        lockGrid->setHorizontalSpacing(14);
+        lockGrid->setVerticalSpacing(10);
+        auto* chkLock = new QCheckBox("Require username + 4-digit PIN to stop this run manually");
+        chkLock->setChecked(pendingPinEnabled_);
+        auto* lblUser = new QLabel("Username");
+        auto* txtUser = new QLineEdit;
+        txtUser->setMaxLength(48);
+        txtUser->setPlaceholderText("e.g. Lab Operator");
+        txtUser->setText(pendingPinUsername_);
+        auto* lblPin = new QLabel("4-digit PIN");
+        auto* pinEntry = new PinEntry(4, /*large=*/false);
+        if (!pendingPin_.isEmpty()) pinEntry->setFromString(pendingPin_);
+        auto* lockErr = new QLabel(" ");
+        lockErr->setStyleSheet("color:#d93025; font-size:12px;");
+        auto* lockNote = new QLabel("If enabled, clicking STOP opens a prompt that shows the username and requires the PIN. The 2-second force-stop escalation and the stall watchdog still bypass the prompt for safety.");
+        lockNote->setWordWrap(true);
+        lockNote->setStyleSheet("color:#667085; font-size:12px;");
+        lockGrid->addWidget(chkLock, 0, 0, 1, 2);
+        lockGrid->addWidget(lblUser, 1, 0);
+        lockGrid->addWidget(txtUser, 1, 1);
+        lockGrid->addWidget(lblPin, 2, 0);
+        lockGrid->addWidget(pinEntry, 2, 1, Qt::AlignLeft);
+        lockGrid->addWidget(lockErr, 3, 0, 1, 2);
+        lockGrid->addWidget(lockNote, 4, 0, 1, 2);
+        layout->addWidget(lockGrp);
+
+        auto setLockEnabled = [&, pinEntry](bool on) {
+            for (auto* w : std::initializer_list<QWidget*>{lblUser, txtUser, lblPin}) {
+                w->setEnabled(on);
+            }
+            pinEntry->setEntryEnabled(on);
+        };
+        setLockEnabled(chkLock->isChecked());
+        connect(chkLock, &QCheckBox::toggled, &dlg, [setLockEnabled](bool on){ setLockEnabled(on); });
+        // Clear any prior error as soon as the operator edits either field.
+        connect(txtUser, &QLineEdit::textEdited, lockErr, [lockErr](const QString&){ lockErr->setText(" "); });
+        connect(pinEntry, &PinEntry::changed, lockErr, [lockErr]{ lockErr->setText(" "); });
 
         auto* confirmRow = new QWidget;
         auto* confirmLayout = new QHBoxLayout(confirmRow);
@@ -2022,10 +2463,35 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         buttons->button(QDialogButtonBox::Ok)->setText("Start Experiment");
         buttons->button(QDialogButtonBox::Ok)->setEnabled(false);
         connect(confirm, &QCheckBox::toggled, buttons->button(QDialogButtonBox::Ok), &QWidget::setEnabled);
-        connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::accepted, &dlg, [&, pinEntry, lockErr]() {
+            if (chkLock->isChecked()) {
+                const QString user = txtUser->text().trimmed();
+                const QString pin = pinEntry->pin();
+                if (user.isEmpty()) {
+                    lockErr->setText("Enter a username (shown on the stop prompt).");
+                    txtUser->setFocus();
+                    return;
+                }
+                static const QRegularExpression kPinPattern("^[0-9]{4}$");
+                if (!kPinPattern.match(pin).hasMatch()) {
+                    lockErr->setText("Enter all 4 digits of the PIN.");
+                    pinEntry->focusFirst();
+                    return;
+                }
+            }
+            dlg.accept();
+        });
         connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
         layout->addWidget(buttons);
-        return dlg.exec() == QDialog::Accepted;
+
+        if (dlg.exec() != QDialog::Accepted) return false;
+
+        // Commit the PIN settings for this run. Cleared in onFinished() so the
+        // next run requires re-entry.
+        pendingPinEnabled_ = chkLock->isChecked();
+        pendingPinUsername_ = pendingPinEnabled_ ? txtUser->text().trimmed() : QString();
+        pendingPin_ = pendingPinEnabled_ ? pinEntry->pin() : QString();
+        return true;
     }
 
     QString autosaveExperimentArtifacts() {
@@ -2138,8 +2604,10 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         if (spnHorizon_) spnHorizon_->setValue(cfg.pid_prediction_horizon_s);
         autoSaveDir_ = qstr(cfg.auto_save_dir);
         chkCycling_->setChecked(cfg.use_cycling);
-        spnHeatS_->setValue(cfg.heating_s);
-        spnCoolS_->setValue(cfg.cooling_s);
+        // Config stores phase durations in seconds; spinboxes display minutes.
+        updateCyclePhaseCaps();
+        spnHeatS_->setValue(cfg.heating_s / 60.0);
+        spnCoolS_->setValue(cfg.cooling_s / 60.0);
         if (cfg.cooling_mode == sonocontrol::CoolingMode::Low) rbCoolLow_->setChecked(true); else rbCoolStop_->setChecked(true);
         spnCoolHoldTemp_->setValue(cfg.cooling_hold_temp);
         setComboData(cmbCom3_, qstr(cfg.com3_port));
@@ -2252,7 +2720,11 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         c.pid_enabled = chkPid_->isChecked();
         c.temperature_enabled = c.pid_enabled || (c.length_mode == sonocontrol::LengthMode::HoldAfterTarget) || (chkTempMonitor_ && chkTempMonitor_->isChecked());
         c.pid_setpoint = spnSetpoint_->value(); c.pid_amplitude = chkPidAmp_->isChecked(); c.pid_duration = chkPidDuration_->isChecked(); c.pid_duty = chkPidDuty_->isChecked(); c.pid_interval = chkPidInterval_->isChecked(); c.pid_kp = spnKp_->value(); c.pid_ki = spnKi_->value(); c.pid_kd = spnKd_->value(); c.pid_prediction_tau_s = spnTau_ ? spnTau_->value() : 25.0; c.pid_prediction_horizon_s = spnHorizon_ ? spnHorizon_->value() : 0.0; c.auto_save_dir = autoSaveDir_.toStdString();
-        c.use_cycling = chkCycling_->isChecked(); c.heating_s = spnHeatS_->value(); c.cooling_s = spnCoolS_->value(); c.cooling_mode = rbCoolStop_->isChecked() ? sonocontrol::CoolingMode::Stop : sonocontrol::CoolingMode::Low; c.cooling_hold_temp = spnCoolHoldTemp_->value();
+        c.use_cycling = chkCycling_->isChecked();
+        // Spinboxes are in minutes; Config carries seconds (interface unchanged).
+        c.heating_s = spnHeatS_->value() * 60.0;
+        c.cooling_s = spnCoolS_->value() * 60.0;
+        c.cooling_mode = rbCoolStop_->isChecked() ? sonocontrol::CoolingMode::Stop : sonocontrol::CoolingMode::Low; c.cooling_hold_temp = spnCoolHoldTemp_->value();
         c.com3_port = cmbCom3_->currentData().toString().toStdString(); c.com11_port = cmbCom11_->currentData().toString().toStdString(); c.temp_channel = static_cast<sonocontrol::TempChannel>(cmbTempChannel_->currentIndex()); c.temp_channel_fallback = chkTempFallback_ && chkTempFallback_->isChecked(); c.udp_host = txtUdpHost_->text().trimmed().toStdString(); c.udp_port = static_cast<uint16_t>(spnUdpPort_->value());
         c.simulate_temp = c.temperature_enabled && debugSimChecked(chkSimTemp_); c.simulate_us = debugSimChecked(chkSimUs_);
         return c;
@@ -2472,6 +2944,13 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
     // one more iteration after we've started tearing down its thread.
     bool shutdownInProgress_ = false;
 
+    // Manual-stop PIN state. Captured from the Preflight Confirmation dialog
+    // for the current run only; cleared in onFinished() so the next run forces
+    // re-entry. Watchdog/force-stop escalation paths ignore these.
+    bool pendingPinEnabled_ = false;
+    QString pendingPinUsername_;
+    QString pendingPin_;
+
     QPushButton *btnStart_{}, *btnStop_{}, *btnTestTemp_{};
     QCheckBox *chkSimTemp_{}, *chkSimUs_{}, *chkPid_{}, *chkTempMonitor_{}, *chkTempFallback_{}, *chkPidAmp_{}, *chkPidDuration_{}, *chkPidInterval_{}, *chkPidDuty_{}, *chkCycling_{}, *chkConsole_{};
     QLabel *lblCom3Status_{}, *lblUsStatus_{}, *lblTempStatus_{}, *lblPortInfo_{}, *lblTempRequirement_{}, *lblConfigStatus_{};
@@ -2498,7 +2977,7 @@ int main(int argc, char** argv) {
     QApplication app(argc, argv);
     QApplication::setStyle("Fusion");
     app.setApplicationName("SonoControl");
-    app.setApplicationVersion("1.6.0-fixed-tau-config-menu");
+    app.setApplicationVersion("1.7.0");
     SonoControlWindow w;
     w.show();
     return app.exec();

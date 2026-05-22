@@ -102,11 +102,19 @@ void ExperimentLogger::start_session(const ActiveParams& initial_params, const C
     if (started_) end_session();
     events_.clear();
     errors_.clear();
+    events_dropped_ = 0;
+    errors_dropped_ = 0;
     total_rows_ = 0;
     total_samples_ = 0;
+    // Reset per-sample experiment-state snapshot for the new session.
+    active_phase_.clear();
+    active_setpoint_c_.reset();
+    active_pid_demand_.reset();
+    active_us_active_ = false;
     start_wall_ = std::chrono::system_clock::now();
     start_steady_ = std::chrono::steady_clock::now();
     last_flush_ = start_steady_;
+    last_meta_save_ = start_steady_;
     started_ = true;
     session_id_ = session_id_from_time(start_wall_);
     initial_params_ = initial_params;
@@ -114,6 +122,10 @@ void ExperimentLogger::start_session(const ActiveParams& initial_params, const C
     session_config_ = config;
     csv_path_ = log_dir_ / (session_id_ + "_log.csv");
     meta_path_ = log_dir_ / (session_id_ + "_meta.json");
+    // pubsetbuf must be called before open() for portable effect; the larger
+    // streambuf reduces write() syscalls ~8× compared to the default 4 KB.
+    // The 5 s explicit flush() still bounds crash data loss to one window.
+    csv_stream_.rdbuf()->pubsetbuf(csv_buffer_.data(), static_cast<std::streamsize>(csv_buffer_.size()));
     csv_stream_.open(csv_path_, std::ios::out | std::ios::trunc);
     if (!csv_stream_) {
         started_ = false;
@@ -127,8 +139,12 @@ void ExperimentLogger::start_session(const ActiveParams& initial_params, const C
 void ExperimentLogger::end_session() {
     if (!started_) return;
     log_event("Session ended");
-    flush();
+    if (csv_stream_) csv_stream_.flush();
+    last_flush_ = std::chrono::steady_clock::now();
+    // Force a final meta rewrite even if the slow-cadence timer hasn't fired,
+    // so the on-disk JSON matches the final state of the session.
     save_meta(meta_path_);
+    last_meta_save_ = last_flush_;
     csv_stream_.close();
     started_ = false;
 }
@@ -150,22 +166,40 @@ void ExperimentLogger::log_params(const ActiveParams& params) {
 void ExperimentLogger::log_event(const std::string& message) {
     if (!started_) return;
     const double rel = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_steady_).count();
-    events_.push_back({rel, message});
+    push_event_bounded(rel, message);
     write_row(make_row(std::nullopt, message));
     maybe_flush();
+}
+
+void ExperimentLogger::log_console_only(const std::string& message) {
+    if (!started_) return;
+    const double rel = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_steady_).count();
+    push_event_bounded(rel, message);
 }
 
 void ExperimentLogger::log_error(const std::string& message) {
     if (!started_) return;
     const double rel = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_steady_).count();
+    if (errors_.size() >= kMaxErrorsRetained) {
+        errors_.pop_front();
+        ++errors_dropped_;
+    }
     errors_.push_back({rel, message});
-    events_.push_back({rel, std::string("ERROR: ") + message});
+    push_event_bounded(rel, std::string("ERROR: ") + message);
     write_row(make_row(std::nullopt, std::string("ERROR: ") + message));
-    flush();
+    // Errors are rare and operationally important — persist meta immediately
+    // so a subsequent crash still has a record of what went wrong.
+    if (csv_stream_) csv_stream_.flush();
+    last_flush_ = std::chrono::steady_clock::now();
+    if (!meta_path_.empty()) save_meta(meta_path_);
+    last_meta_save_ = last_flush_;
 }
 
 void ExperimentLogger::write_header() {
-    csv_stream_ << "timestamp,time_s,T1_C,T2_C,temp_C,amplitude,cfreq_kHz,prf_Hz,duty_pct,duration_ms,interval_s,wave_shape,config_type,config_file,event\n";
+    // Schema-stable columns come first; new per-sample experiment-state
+    // columns are appended at the end so column-index-based readers of the
+    // previous CSV continue to work for the columns they already knew about.
+    csv_stream_ << "timestamp,time_s,T1_C,T2_C,temp_C,amplitude,cfreq_kHz,prf_Hz,duty_pct,duration_ms,interval_s,wave_shape,config_type,config_file,event,phase,setpoint_C,pid_demand_pct,us_active\n";
 }
 
 void ExperimentLogger::write_row(const Row& r) {
@@ -184,7 +218,12 @@ void ExperimentLogger::write_row(const Row& r) {
                 << to_string(r.params.wave_shape) << ','
                 << csv_escape(session_config_.config_source_type) << ','
                 << csv_escape(session_config_.config_file_path) << ','
-                << csv_escape(r.event) << '\n';
+                << csv_escape(r.event) << ','
+                << csv_escape(r.phase) << ','
+                << (r.setpoint_c ? fmt_double(*r.setpoint_c, 3) : "") << ','
+                << (r.pid_demand_fraction ? fmt_double(*r.pid_demand_fraction * 100.0, 2) : "") << ','
+                << (r.us_active ? 1 : 0)
+                << '\n';
     ++total_rows_;
 }
 
@@ -195,10 +234,27 @@ void ExperimentLogger::maybe_flush() {
     }
 }
 
+void ExperimentLogger::push_event_bounded(double rel_s, std::string message) {
+    if (events_.size() >= kMaxEventsRetained) {
+        events_.pop_front();
+        ++events_dropped_;
+    }
+    events_.push_back({rel_s, std::move(message)});
+}
+
 void ExperimentLogger::flush() {
     if (csv_stream_) csv_stream_.flush();
-    last_flush_ = std::chrono::steady_clock::now();
-    if (started_ && !meta_path_.empty()) save_meta(meta_path_);
+    const auto now = std::chrono::steady_clock::now();
+    last_flush_ = now;
+    if (!started_ || meta_path_.empty()) return;
+    // save_meta is O(events + errors); on the 5 s flush cadence with a long
+    // running session that was the dominant background cost. Rewrite the
+    // metadata at a slower cadence than the CSV flush.
+    const double since_meta = std::chrono::duration<double>(now - last_meta_save_).count();
+    if (since_meta >= static_cast<double>(meta_save_interval_s_)) {
+        save_meta(meta_path_);
+        last_meta_save_ = now;
+    }
 }
 
 ExperimentLogger::Row ExperimentLogger::make_row(std::optional<double> temp,
@@ -207,7 +263,25 @@ ExperimentLogger::Row ExperimentLogger::make_row(std::optional<double> temp,
                                                  std::optional<double> t2) const {
     const auto now = std::chrono::system_clock::now();
     const double rel = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_steady_).count();
-    return Row{timestamp_ms(now), rel, t1, t2, temp, active_params_, event};
+    Row r{timestamp_ms(now), rel, t1, t2, temp, active_params_, event,
+          active_phase_, active_setpoint_c_, active_pid_demand_, active_us_active_};
+    return r;
+}
+
+void ExperimentLogger::set_phase(const std::string& phase) {
+    active_phase_ = phase;
+}
+
+void ExperimentLogger::set_setpoint(std::optional<double> setpoint_c) {
+    active_setpoint_c_ = setpoint_c;
+}
+
+void ExperimentLogger::set_pid_demand(std::optional<double> demand_fraction) {
+    active_pid_demand_ = demand_fraction;
+}
+
+void ExperimentLogger::set_ultrasound_active(bool active) {
+    active_us_active_ = active;
 }
 
 void ExperimentLogger::export_csv(const std::filesystem::path& path) const {
@@ -216,7 +290,7 @@ void ExperimentLogger::export_csv(const std::filesystem::path& path) const {
         return;
     }
     std::ofstream f(path, std::ios::out | std::ios::trunc);
-    f << "timestamp,time_s,T1_C,T2_C,temp_C,amplitude,cfreq_kHz,prf_Hz,duty_pct,duration_ms,interval_s,wave_shape,config_type,config_file,event\n";
+    f << "timestamp,time_s,T1_C,T2_C,temp_C,amplitude,cfreq_kHz,prf_Hz,duty_pct,duration_ms,interval_s,wave_shape,config_type,config_file,event,phase,setpoint_C,pid_demand_pct,us_active\n";
 }
 
 void ExperimentLogger::save_meta(const std::filesystem::path& path) const {
@@ -262,6 +336,8 @@ void ExperimentLogger::save_meta(const std::filesystem::path& path) const {
     f << "  ],\n";
     f << "  \"total_rows\": " << total_rows_ << ",\n";
     f << "  \"total_samples\": " << total_samples_ << ",\n";
+    f << "  \"events_dropped\": " << events_dropped_ << ",\n";
+    f << "  \"errors_dropped\": " << errors_dropped_ << ",\n";
     f << "  \"error_count\": " << errors_.size() << "\n";
     f << "}\n";
 }

@@ -76,18 +76,29 @@ bool UdpSender::send_to(const uint8_t* data, size_t size, const std::string& hos
 #else
     if (socket_ < 0) return false;
 #endif
+    // Reuse the cached destination when (host, port) hasn't changed. Saves
+    // 4095 inet_pton/getaddrinfo calls per UDP waveform burst and avoids
+    // repeated DNS traffic if `host` happens to be a hostname.
+    if (!cached_dst_valid_ || cached_port_ != port || cached_host_ != host) {
+        in_addr ina{};
+        if (inet_pton(AF_INET, host.c_str(), &ina) != 1) {
+            addrinfo hints{};
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_DGRAM;
+            addrinfo* res = nullptr;
+            if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || res == nullptr) return false;
+            ina = reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr;
+            freeaddrinfo(res);
+        }
+        cached_addr_net_ = ina.s_addr;
+        cached_host_ = host;
+        cached_port_ = port;
+        cached_dst_valid_ = true;
+    }
     sockaddr_in dst{};
     dst.sin_family = AF_INET;
     dst.sin_port = htons(port);
-    if (inet_pton(AF_INET, host.c_str(), &dst.sin_addr) != 1) {
-        addrinfo hints{};
-        hints.ai_family = AF_INET;
-        hints.ai_socktype = SOCK_DGRAM;
-        addrinfo* res = nullptr;
-        if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || res == nullptr) return false;
-        dst.sin_addr = reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr;
-        freeaddrinfo(res);
-    }
+    dst.sin_addr.s_addr = cached_addr_net_;
 #ifdef _WIN32
     const int sent = sendto(static_cast<SOCKET>(socket_), reinterpret_cast<const char*>(data), static_cast<int>(size), 0,
                             reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
@@ -110,6 +121,9 @@ void UdpSender::close() {
         socket_ = -1;
     }
 #endif
+    cached_dst_valid_ = false;
+    cached_host_.clear();
+    cached_port_ = 0;
 }
 
 void UdpSender::cancel_io() {

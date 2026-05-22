@@ -30,6 +30,17 @@ private:
 #else
     int socket_ = -1;
 #endif
+
+    // Cached destination resolved from the last (host, port) pair. The UDP
+    // waveform burst sends 4096 packets to the same target in tight
+    // succession, so caching skips 4095 redundant inet_pton/getaddrinfo
+    // calls per burst (and avoids per-packet DNS when host[] is a hostname).
+    // Stored as a raw network-order IPv4 to keep this header free of the
+    // platform socket headers — sockaddr_in is rebuilt at send time.
+    std::string cached_host_;
+    uint32_t cached_addr_net_ = 0;
+    uint16_t cached_port_ = 0;
+    bool cached_dst_valid_ = false;
 };
 
 } // namespace sonocontrol

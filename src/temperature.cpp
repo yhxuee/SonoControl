@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -71,16 +72,77 @@ std::string HH806AUSensor::hex_dump(const std::vector<uint8_t>& bytes) {
 
 void HH806AUSensor::log_raw_issue(const std::string& reason, const std::vector<uint8_t>& bytes) const {
     try {
+        // Daily-rotated raw log with consecutive-duplicate coalescing. With an
+        // unplugged probe the meter emits the same "not connected" status byte
+        // for every poll (~3 Hz); writing each occurrence used to grow the file
+        // by ~30 MB/day. Repeats are collapsed into a single trailing summary
+        // line, and the active file name carries the local date so it rolls
+        // over at midnight on its own.
         static std::mutex log_mutex;
+        static std::ofstream stream;
+        static std::string current_date;
+        static std::string last_key;
+        static std::string last_bytes_hex;
+        static std::chrono::system_clock::time_point last_seen{};
+        static std::uint64_t repeat_count = 0;
+
         std::lock_guard<std::mutex> g(log_mutex);
-        const auto dir = std::filesystem::current_path() / "logs";
-        std::filesystem::create_directories(dir);
-        std::ofstream f(dir / "hh806au_raw.log", std::ios::out | std::ios::app);
-        if (!f) return;
-        f << timestamp_ms(std::chrono::system_clock::now())
-          << " port=" << port_
-          << " reason=" << reason
-          << " bytes=" << hex_dump(bytes) << '\n';
+        const auto now = std::chrono::system_clock::now();
+        const auto tt = std::chrono::system_clock::to_time_t(now);
+        std::tm tm{};
+#ifdef _WIN32
+        localtime_s(&tm, &tt);
+#else
+        localtime_r(&tt, &tm);
+#endif
+        char date_buf[16];
+        std::strftime(date_buf, sizeof(date_buf), "%Y%m%d", &tm);
+        const std::string today(date_buf);
+
+        auto open_today = [&]() {
+            const auto dir = std::filesystem::current_path() / "logs";
+            std::filesystem::create_directories(dir);
+            stream.open(dir / ("hh806au_raw_" + today + ".log"), std::ios::out | std::ios::app);
+            current_date = today;
+        };
+
+        auto flush_repeat_summary = [&]() {
+            if (repeat_count > 0 && stream) {
+                stream << timestamp_ms(last_seen)
+                       << " port=" << port_
+                       << " repeat last=" << repeat_count
+                       << " reason=" << last_key << '\n';
+            }
+            repeat_count = 0;
+            last_key.clear();
+            last_bytes_hex.clear();
+        };
+
+        if (today != current_date) {
+            flush_repeat_summary();
+            if (stream.is_open()) stream.close();
+            open_today();
+        }
+        if (!stream.is_open()) open_today();
+        if (!stream) return;
+
+        // Key on reason + the per-event byte signature so transient framing
+        // glitches stay distinct from steady-state status-byte chatter.
+        const std::string bytes_hex = hex_dump(bytes);
+        const std::string key = reason + "|" + bytes_hex;
+        if (key == last_key) {
+            ++repeat_count;
+            last_seen = now;
+            return;
+        }
+        flush_repeat_summary();
+        stream << timestamp_ms(now)
+               << " port=" << port_
+               << " reason=" << reason
+               << " bytes=" << bytes_hex << '\n';
+        last_key = std::move(key);
+        last_bytes_hex = bytes_hex;
+        last_seen = now;
     } catch (...) {
         // Diagnostic logging must never break temperature acquisition.
     }
