@@ -24,7 +24,9 @@ The project provides:
 | PID control | Kp/Ki/Kd with predictive thermal model: `T_future = T + τ × dT/dt × (1 − e^{−t/τ})` |
 | Experiment modes | Total duration, repeating cycles, or hold-after-target-reached |
 | Cycling | Alternating heating/cooling phases with configurable durations |
-| Safety | Configurable temperature cutoff with debounce (N samples, min spacing) |
+| **Sequence** | **Queue multiple `.config` files back-to-back with per-gap intervals; each entry runs as an independent experiment with its own log** |
+| **Monitoring web server** | **Optional read-only HTTP endpoint (default 127.0.0.1:50896) that serves a self-contained HTML+JS page with the latest cached temperature samples, elapsed/remaining time, and run state. Configurable port, snapshot interval, and LAN-bind toggle. Off by default at every app launch.** |
+| Safety | Configurable temperature cutoff with debounce (N samples, min spacing); optional fail-closed mode that aborts on sustained sensor loss; PIN-gated manual stop (per run and per sequence) |
 | Logging | Streaming CSV log + JSON metadata; auto-save artifacts on completion |
 | GUI | Dark/light theme, real-time temperature plot, waveform preview, preflight checks |
 | Reliability | Exponential-backoff serial retry, persistent COM3 option, stall watchdog |
@@ -122,13 +124,15 @@ Launch `sonocontrol_gui.exe`. The interface has four tabs on the left panel:
 | **CYCLE** | Heating/cooling cycle durations and cooling behaviour |
 | **CONNECT** | COM ports, UDP host/port, HH806AU settings, appearance |
 
-**Workflow:**
+**Workflow (single run):**
 1. Select COM ports in the CONNECT tab; click **Scan Ports** if needed.
 2. If using temperature monitoring, click **Test** next to the HH806AU port to verify sensor response.
 3. Set ultrasound parameters and experiment length in PARAMS.
 4. Optionally configure PID in the PID tab.
 5. Click **▶ START**. A preflight dialog shows a full configuration summary and requires confirmation.
 6. Click **■ EMERGENCY STOP** to stop. A graceful stop is attempted first; after 2 s the stop escalates to cancel pending I/O if the worker is wedged.
+
+For unattended back-to-back runs use **Edit → Sequence…** (see the *Experiment Sequence* section below) instead of the per-run workflow.
 
 **Saving / loading configuration:**
 - **File → Save Configuration** writes a `.config` file with all current settings.
@@ -139,6 +143,22 @@ Launch `sonocontrol_gui.exe`. The interface has four tabs on the left panel:
 - **File → Export CSV** exports the temperature log from the current session.
 - **File → Export Picture** saves the temperature plot as PNG.
 - After a successful experiment, all artifacts (CSV, JSON metadata, plots) are auto-saved under `./experiments/<session>/` or the configured auto-save directory.
+
+**Experiment Sequence** (Edit → Sequence…)
+
+Queue multiple `.config` files to run back-to-back as independent experiments. Open the dialog with **Edit → Sequence…**, then:
+
+1. Add configs by dragging `.config` files from Explorer onto the list, or click **Add Configs…** to pick them. Each row uses `↑` / `↓` to reorder and `×` to remove.
+2. Between every adjacent pair of configurations the dialog shows an **Interval** spin box in minutes (range `0..600`, default 5). Set each gap independently — e.g. 30 min between configs 1 and 2, 15 min between configs 2 and 3.
+3. Optionally tick **Abort the rest of the sequence if a configuration fails** so a safety cutoff, hardware error, or watchdog force-stop ends the whole queue instead of advancing to the next config.
+4. Optionally enable **Manual-stop PIN protection (sequence)** with a username and a 4-digit PIN. The sequence STOP button will then require the PIN before stopping.
+5. Click **▶ Start Sequence**. The dialog can be closed while the sequence runs — the queue keeps executing, and reopening the dialog re-binds to the live state.
+
+Notes:
+- The main page **▶ START** and **■ EMERGENCY STOP** are locked out while a sequence is queued; use the dialog's buttons instead.
+- The sequence has no preflight confirmation window. Each queued configuration is run as if started normally, and **each one writes its own timestamped log** under `./logs/` — there is no separate "sequence log" type.
+- **Estimated total time** sums every config's expected duration plus every per-gap interval. It is shown as *unavailable* when any queued configuration uses *After-target Hold* mode, because the hold duration depends on a not-yet-known temperature event.
+- The 2-second force-stop escalation and the stall watchdog still bypass the sequence PIN, so safety paths cannot be locked out.
 
 ### CLI
 
@@ -155,7 +175,7 @@ Ultrasound:
   --prf-hz X            Pulse repetition frequency in Hz (default 1000)
   --duty-pct X          Duty cycle 0..100 % (default 50)
   --duration-ms N       Ultrasound burst duration in ms (default 1000)
-  --interval-s X        Interval between bursts in seconds (default 5)
+  --interval-s X        Interval between bursts in seconds (default 5, min 0.2 — see "Interval floor")
   --wave sine|square|triangle  Waveform shape (default sine)
 
 Experiment length:
@@ -217,6 +237,7 @@ total_duration_mins = 60.0
 
 [temperature]
 temperature_enabled = true
+temperature_required = false           # true = abort run on 3 consecutive invalid HH806AU reads
 temp_channel        = T1               # T1 | T2 | Average
 temp_channel_fallback = false
 min_plausible_temp_c = 10.0
@@ -249,6 +270,13 @@ communication_retry_attempts = 3
 communication_retry_initial_backoff_ms = 80
 emergency_stop_repeats = 5
 watchdog_timeout_ms = 5000
+
+[web_server]
+web_server_port            = 50896
+web_server_snapshot_interval_s = 900   # 5..3600 seconds
+web_server_lan             = false     # true = bind all interfaces (LAN-reachable)
+# web_server_enabled is intentionally NOT serialized — the server always
+# starts disabled on app launch and must be turned on manually.
 ```
 
 Generate a fully-commented template:
@@ -311,6 +339,28 @@ sonocontrol --write-config-template sonocontrol_config_template.config
 - The EMA smoothing coefficient (`α = 0.25`) is compile-time constant, not configurable. Adjust in `src/experiment.cpp` if needed.
 - Cycling mode is only available in Total Duration mode; it is silently disabled in Repeating or Hold-After-Target modes.
 - Auto-save creates files only on clean completion (exit code 0). Manual stops and cutoff events do not trigger auto-save.
+- An experiment sequence continues to the next queued configuration even if the current one ends with an error (e.g. watchdog force-stop or hardware error). To abort the whole sequence in that case, either tick **Abort the rest of the sequence if a configuration fails** in the Sequence dialog before starting, or click the sequence's **■ Stop Sequence** button manually. The safety cutoff fires per-configuration as usual.
+
+### Monitoring web server (optional)
+
+The CONNECT tab has a **Monitoring Web Server** group that exposes an optional, read-only HTTP endpoint for unattended monitoring. When enabled, the server serves:
+
+- `GET /` — a self-contained HTML page (≈ 4 KB + JSON blob) with the latest cached temperature samples, elapsed / remaining time, run state, and a `<canvas>`-drawn line chart of T1 / T2 / Avg. All chart drawing happens in the browser — no external CDN, no server-side rendering.
+- `GET /data.json` — the same payload as JSON for scripting / external tooling.
+
+Behaviour:
+
+- **Off by default at every app launch.** The enable flag is deliberately session-only — loading a `.config` file cannot silently turn the server on. Port, snapshot interval, and the LAN-bind flag *are* persisted in `.config`.
+- **Default bind:** `127.0.0.1` (localhost only). Tick **Allow LAN access** to bind all interfaces — this makes the wireless NIC's LAN IP reachable. The status line then lists all bound URLs (`http://127.0.0.1:port/` plus every non-loopback IPv4 on an up interface). There is **no authentication and no HTTPS**, so only enable LAN access on trusted networks.
+- **Snapshot interval:** 5..3600 s, default 900 (15 min). The server rebuilds the cached HTML+JSON every interval, AND immediately on key events (server start, run start, first sample after idle, run finish). A 5–10 s interval is appropriate for live-ish monitoring; longer intervals are fine for fire-and-forget multi-day runs.
+- **Live buffer cap:** 500 most recent samples (~16 KB). Long-running experiments don't grow memory.
+- **Robustness:** request header capped at 8 KiB, 5 s read timeout per connection, `GET`-only, query strings stripped before path matching, `Cache-Control: no-store`, `Connection: close`.
+
+Compile-time: requires Qt's `Network` module. If the GUI was built against a Qt without `Network`, the group is replaced with an explanatory note and the feature is unavailable.
+
+### Interval floor
+
+`interval_time_s` is clamped to `max(duration_ms / 1000, 0.2 s)` in **every** entry point — the GUI spin box minimum, the GUI's `validate_config`, the CLI's `validate_config`, and the per-config validation that the sequence runner performs before launching each queued experiment. A `.config` file or `--interval-s 0.01` is therefore raised to the floor (the CLI prints a `[WARN]` line; the GUI silently clamps because the spin box doesn't let the value through in the first place). The 0.2 s floor reflects the fact that each transmit cycle issues a serial CFREQ/PRF/DUR triple — each followed by the hardware-required 100 ms COM gap — plus the 4096-datagram UDP waveform burst, and cannot physically complete faster than ~0.3 s on real hardware. The shared constant lives in `include/config.hpp` as `sonocontrol::kMinIntervalTimeS`.
 
 ---
 
@@ -341,7 +391,8 @@ src/
   udp_socket.cpp
   main.cpp            CLI entry point + argument parser
   gui/
-    main_gui.cpp      Qt Widgets GUI (single-file, ~2500 lines)
+    main_gui.cpp      Qt Widgets GUI (single-file, ~3500 lines, includes
+                      Sequence dialog and runner)
 ```
 
 ### Key design decisions

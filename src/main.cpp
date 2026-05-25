@@ -117,7 +117,22 @@ void validate_config(Config& c) {
     c.amplitude = std::clamp(c.amplitude, 0.0, 1.0);
     c.duty_cycle = std::clamp(c.duty_cycle, 0.0, 1.0);
     c.duration_ms = std::max(0, c.duration_ms);
-    c.interval_time_s = std::max(c.interval_time_s, static_cast<double>(c.duration_ms) / 1000.0);
+    // Interval floor — see sonocontrol::kMinIntervalTimeS in config.hpp.
+    // The GUI enforces the same floor at the input widget; this guard
+    // catches CLI flags (e.g. --interval-s 0.01) and config-file values
+    // that would otherwise bypass it.
+    {
+        const double requested = c.interval_time_s;
+        const double duration_floor = static_cast<double>(c.duration_ms) / 1000.0;
+        const double clamped = std::max({requested, duration_floor, kMinIntervalTimeS});
+        if (clamped > requested) {
+            std::cerr << "[WARN] interval_time_s=" << requested
+                      << " s is below the realistic per-cycle floor ("
+                      << kMinIntervalTimeS << " s and >= duration); raised to "
+                      << clamped << " s.\n";
+        }
+        c.interval_time_s = clamped;
+    }
     c.sampling_rate_hz = std::max(0.1, c.sampling_rate_hz);
     c.total_duration_mins = std::max(0.0, c.total_duration_mins);
     c.repeating = std::max(1, c.repeating);
@@ -184,7 +199,11 @@ Config parse_args(int argc, char** argv, bool& protocol_check, bool& help, std::
         else if (a == "--com3") c.com3_port = need_value(args, i, a);
         else if (a == "--com11") c.com11_port = need_value(args, i, a);
         else if (a == "--udp-host") c.udp_host = need_value(args, i, a);
-        else if (a == "--udp-port") c.udp_port = static_cast<uint16_t>(parse_int(need_value(args, i, a), a));
+        else if (a == "--udp-port") {
+            const int v = parse_int(need_value(args, i, a), a);
+            if (v < 1 || v > 65535) throw std::invalid_argument("--udp-port must be between 1 and 65535: " + std::to_string(v));
+            c.udp_port = static_cast<uint16_t>(v);
+        }
         else if (a == "--temp-channel") c.temp_channel = parse_temp_channel(need_value(args, i, a));
         else if (a == "--real-hardware") { c.simulate_temp = false; c.simulate_us = false; }
         else if (a == "--sim-temp") {

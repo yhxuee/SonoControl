@@ -76,10 +76,17 @@ ExperimentRunner::ExperimentRunner(Config config,
     : config_(std::move(config)), sensor_(std::move(sensor)), logger_(logger), callbacks_(std::move(callbacks)) {}
 
 void ExperimentRunner::request_stop() {
+    // Latch FIRST: stop_flag_ may be temporarily cleared by send_stop() to
+    // force STOP packet delivery. If request_stop fires during that window,
+    // stop_flag_=true would be overwritten back to false on the restore — but
+    // manual_stop_latched_ is monotonic, so end-of-run code selection still
+    // sees the operator intent.
+    manual_stop_latched_ = true;
     stop_flag_ = true;
 }
 
 void ExperimentRunner::force_stop() {
+    manual_stop_latched_ = true;
     // Order matters: set the flag first so that any code that recovers from a
     // cancelled I/O sees the stop request and bails out instead of retrying.
     stop_flag_ = true;
@@ -96,6 +103,7 @@ ActiveParams ExperimentRunner::initial_params_from_config(const Config& c) {
 
 int ExperimentRunner::run() {
     stop_flag_ = false;
+    manual_stop_latched_ = false;
     PIDController pid(config_.pid_kp, config_.pid_ki, config_.pid_kd);
 
     const ActiveParams initial_params = initial_params_from_config(config_);
@@ -137,6 +145,23 @@ int ExperimentRunner::run() {
     auto previous_temp_sample_time = experiment_start;
 
     logger_.start_session(initial_params, config_);
+    // Seed the per-sample state columns. Phase tracks the experiment state
+    // machine: HEATING for plain runs and PID heating, WAIT_TARGET while
+    // HoldAfterTarget mode is climbing to setpoint. Setpoint is populated
+    // whenever a control target exists (PID enabled, or HoldAfterTarget).
+    // Demand and US active follow the first transmit / PID compute.
+    if (config_.length_mode == LengthMode::HoldAfterTarget) {
+        logger_.set_phase("WAIT_TARGET");
+        logger_.set_setpoint(config_.pid_setpoint);
+    } else if (config_.pid_enabled) {
+        logger_.set_phase("HEATING");
+        logger_.set_setpoint(config_.pid_setpoint);
+    } else {
+        logger_.set_phase("HEATING");
+        logger_.set_setpoint(std::nullopt);
+    }
+    logger_.set_pid_demand(std::nullopt);
+    logger_.set_ultrasound_active(false);
     log_console(std::string("Experiment started. Length mode=") + to_string(config_.length_mode) +
                 ", planned=" + (config_.length_mode == LengthMode::HoldAfterTarget
                     ? ("hold " + fmt_double(hold_after_target_s, 1) + "s after target")
@@ -276,7 +301,7 @@ int ExperimentRunner::run() {
                 const double out_t2 = t2 ? *t2 : std::numeric_limits<double>::quiet_NaN();
                 const std::string s_t1 = t1 ? (fmt_double(*t1, 2) + " C") : std::string("N/C");
                 const std::string s_t2 = t2 ? (fmt_double(*t2, 2) + " C") : std::string("N/C");
-                log_console("TEMP  T1=" + s_t1 + "  T2=" + s_t2 + "  CTRL=" + fmt_double(avg, 2) + " C [" + active_channel + "]" +
+                log_console_quiet("TEMP  T1=" + s_t1 + "  T2=" + s_t2 + "  CTRL=" + fmt_double(avg, 2) + " C [" + active_channel + "]" +
                             (config_.pid_enabled ? ("  PRED=" + fmt_double(predicted_control_temp, 2) +
                                 " C  RATE=" + fmt_double(control_rate_c_per_s, 3) +
                                 " C/s  THERM=" + fmt_double(prediction_tau_s, 1) +
@@ -326,13 +351,19 @@ int ExperimentRunner::run() {
                     if (std::abs(avg - config_.pid_setpoint) <= target_tolerance) {
                         target_hold_started = true;
                         target_hold_start = now;
+                        logger_.set_phase("TARGET_HOLD");
                         log_console("Target reached: " + fmt_double(avg, 2) + "°C is within ±" +
                                     fmt_double(target_tolerance, 2) + "°C of setpoint " + fmt_double(config_.pid_setpoint, 2) +
                                     "°C. Hold timer started for " + fmt_double(hold_after_target_s, 1) + "s.");
                         logger_.log_event("Target-hold timer started");
                         if (callbacks_.cycle) callbacks_.cycle("TARGET HOLD");
-                    } else if (callbacks_.cycle) {
-                        callbacks_.cycle("WAIT TARGET");
+                    } else {
+                        // set_phase is idempotent on the string — re-asserting
+                        // WAIT_TARGET every sample is cheap and keeps the row
+                        // labelled correctly even if a prior code path
+                        // overwrote the phase column.
+                        logger_.set_phase("WAIT_TARGET");
+                        if (callbacks_.cycle) callbacks_.cycle("WAIT TARGET");
                     }
                 }
 
@@ -346,7 +377,12 @@ int ExperimentRunner::run() {
                     if (setpoint) {
                         const double control_temp_for_pid = prediction_tau_s > 0.0 ? predicted_control_temp : control_temp_filtered;
                         const double demand = pid.compute(*setpoint, control_temp_for_pid);
-                        log_console("PID   set=" + fmt_double(*setpoint, 2) +
+                        // Setpoint and demand are recorded as per-sample CSV
+                        // columns (setpoint_C, pid_demand_pct); the verbose
+                        // line stays out of the CSV to keep the file small.
+                        logger_.set_setpoint(*setpoint);
+                        logger_.set_pid_demand(demand);
+                        log_console_quiet("PID   set=" + fmt_double(*setpoint, 2) +
                                     " C  control=" + fmt_double(control_temp_for_pid, 2) +
                                     " C  demand=" + fmt_double(demand * 100.0, 1) +
                                     "%  tau-model");
@@ -358,14 +394,18 @@ int ExperimentRunner::run() {
             } else {
                 over_cutoff_samples = 0;
                 ++invalid_temp_samples;
-                log_console("TEMP  T1=N/C  T2=N/C");
+                log_console_quiet("TEMP  T1=N/C  T2=N/C");
                 if (!config_.simulate_temp && invalid_temp_samples >= 3) {
                     const std::string msg = "Temperature sensor returned no valid data for 3 consecutive samples. Check COM port, probe connection, and HH806AU power.";
-                    if (config_.pid_enabled) {
+                    // PID and the operator-selected fail-closed mode both
+                    // abort: the run cannot continue safely without a working
+                    // temperature reading. Otherwise we degrade to monitoring-
+                    // off and let the ultrasound continue.
+                    if (config_.pid_enabled || config_.temperature_required) {
                         logger_.log_error(msg);
                         throw std::runtime_error(msg);
                     }
-                    log_console("[WARN] " + msg + " Temperature monitoring and software cutoff are disabled for the rest of this run; ultrasound continues without PID.");
+                    log_console("[WARN] " + msg + " Temperature monitoring and software cutoff are disabled for the rest of this run; ultrasound continues without PID. (Set temperature_required=true to abort instead.)");
                     logger_.log_event("WARNING: " + msg + " Monitoring disabled for rest of run.");
                     config_.temperature_enabled = false;
                 }
@@ -373,7 +413,7 @@ int ExperimentRunner::run() {
         }
 
         if (static_cast<int>(elapsed * 2.0) != static_cast<int>((elapsed - 0.05) * 2.0)) {
-            log_console("TIME  elapsed=" + fmt_double(elapsed, 1) + "s  remaining=" + fmt_double(remaining, 1) + "s");
+            log_console_quiet("TIME  elapsed=" + fmt_double(elapsed, 1) + "s  remaining=" + fmt_double(remaining, 1) + "s");
             if (callbacks_.time) callbacks_.time(elapsed, remaining);
         }
 
@@ -383,13 +423,18 @@ int ExperimentRunner::run() {
                 phase = CyclePhase::Cooling;
                 phase_start = now;
                 pid.reset();
+                logger_.set_pid_demand(std::nullopt);
                 if (config_.cooling_mode == CoolingMode::Stop) {
                     send_stop();
                     sensor_->set_ultrasound_params(0.0, 0.0, 0, 1.0);
+                    logger_.set_phase("COOLING");
+                    logger_.set_setpoint(std::nullopt);
                     log_console("Cycle: COOLING — stopped");
                     log_console("Phase → COOLING (ultrasound stopped)");
                     if (callbacks_.cycle) callbacks_.cycle("COOLING");
                 } else {
+                    logger_.set_phase("COOLING_HOLD");
+                    logger_.set_setpoint(config_.cooling_hold_temp);
                     log_console("Cycle: COOLING — hold");
                     log_console("Phase → COOLING (PID hold at " + fmt_double(config_.cooling_hold_temp, 1) + "°C)");
                     if (callbacks_.cycle) callbacks_.cycle("COOLING HOLD");
@@ -398,6 +443,9 @@ int ExperimentRunner::run() {
                 phase = CyclePhase::Heating;
                 phase_start = now;
                 pid.reset();
+                logger_.set_phase("HEATING");
+                logger_.set_setpoint(config_.pid_enabled ? std::optional<double>(config_.pid_setpoint) : std::nullopt);
+                logger_.set_pid_demand(std::nullopt);
                 log_console("Cycle: HEATING");
                 log_console("Phase → HEATING");
                 last_burst_valid_ = false;
@@ -425,9 +473,14 @@ int ExperimentRunner::run() {
         interruptible_sleep_ms(50, stop_flag_);
     }
 
-    const bool stopped_by_user = stop_flag_.load();
+    // Use the latched manual-stop flag, not the live stop_flag_. The live
+    // flag is briefly cleared inside send_stop() to push the STOP packet
+    // through com_write(); a request_stop() landing in that window used to
+    // be overwritten back to false, mis-reporting a manual stop as a clean
+    // completion. The latch is monotonic and only set by request_stop /
+    // force_stop, so it survives the load/clear/restore cycle.
     send_stop();
-    if (stopped_by_user) {
+    if (manual_stop_latched_.load()) {
         log_console("Experiment stopped manually. Emergency STOP sent.");
         logger_.log_event("Manual emergency stop");
         logger_.end_session();
@@ -507,7 +560,7 @@ void ExperimentRunner::com_write(const protocol::ComPacket& packet, const std::s
                                      (last_error.empty() ? "" : (" (" + last_error + ")")));
         }
     }
-    log_console("> " + left_width(label, 5) + " " + protocol::format_hex(packet) + (config_.simulate_us ? " [SIM]" : ""));
+    log_console_quiet("> " + left_width(label, 5) + " " + protocol::format_hex(packet) + (config_.simulate_us ? " [SIM]" : ""));
     // COM-gap sleep also needs to be interruptible: 100 ms × 5 packets per
     // burst would otherwise add ~500 ms of latency to every emergency stop.
     interruptible_sleep_ms(static_cast<int>(COM_GAP_S * 1000.0), stop_flag_);
@@ -532,6 +585,10 @@ void ExperimentRunner::transmit(const ActiveParams& params) {
         if (!config_.simulate_us) {
             if (burst_changed) {
                 last_burst_ = protocol::build_udp_burst(params.amplitude, params.duty_cycle, params.wave_shape);
+                // Regenerate the GUI preview vector at the same time so the
+                // common steady-state case (no change) skips the 4096-sample
+                // float conversion in waveform_float_array entirely.
+                last_waveform_floats_ = protocol::waveform_float_array(params.amplitude, params.duty_cycle, params.wave_shape);
                 last_burst_amp_ = params.amplitude;
                 last_burst_duty_ = params.duty_cycle;
                 last_burst_shape_ = params.wave_shape;
@@ -559,14 +616,25 @@ void ExperimentRunner::transmit(const ActiveParams& params) {
         }
 
         if (stop_flag_) return;
-        log_console("> UDP   4096 samples  amp=" + fmt_double(params.amplitude, 3) +
+        log_console_quiet("> UDP   4096 samples  amp=" + fmt_double(params.amplitude, 3) +
                     "  duty=" + fmt_double(params.duty_cycle * 100.0, 1) + "%  shape=" +
                     to_string(params.wave_shape) + (config_.simulate_us ? " [SIM]" : ""));
         if (callbacks_.params) callbacks_.params(params);
-        if (callbacks_.waveform) callbacks_.waveform(protocol::waveform_float_array(params.amplitude, params.duty_cycle, params.wave_shape));
+        if (callbacks_.waveform) {
+            // Build the preview lazily when sim mode skipped the cache update,
+            // otherwise hand the cached vector to the GUI signal (it copies).
+            if (last_waveform_floats_.empty() || burst_changed) {
+                last_waveform_floats_ = protocol::waveform_float_array(params.amplitude, params.duty_cycle, params.wave_shape);
+            }
+            callbacks_.waveform(last_waveform_floats_);
+        }
 
         sensor_->set_ultrasound_params(params.amplitude, params.duty_cycle, params.duration_ms, params.interval_time_s);
         sensor_->set_ultrasound_active(true);
+        // Update the per-sample US-active column. duration_ms=0 is the
+        // protocol's "stop" command — treat that as inactive even if a burst
+        // was transmitted for state reset purposes.
+        logger_.set_ultrasound_active(params.duration_ms > 0);
     } catch (const std::exception& e) {
         notify_error(e.what());
         throw;
@@ -587,16 +655,18 @@ void ExperimentRunner::send_stop() {
         for (int i = 0; i < repeats; ++i) {
             // Temporarily clear stop_flag_ so com_write() does not bail out
             // before the hardware STOP packet is transmitted. The flag is
-            // restored afterwards. Note: force_stop() from the GUI thread can
-            // race with this load/clear/restore sequence. The only observable
-            // consequence of the race is that the post-stop return code may be
-            // 0 instead of 3 — the hardware STOP is always sent either way.
+            // restored afterwards. A request_stop()/force_stop() landing in
+            // this window will still set stop_flag_ to true, but the restore
+            // will overwrite it — that's why the post-loop return-code
+            // decision reads manual_stop_latched_ (monotonic) instead of
+            // stop_flag_. The hardware STOP is always sent either way.
             const bool was_stop = stop_flag_.load();
             stop_flag_ = false;
             com_write(protocol::pkt_stop(), "STOP");
             stop_flag_ = was_stop;
         }
         sensor_->set_ultrasound_active(false);
+        logger_.set_ultrasound_active(false);
     } catch (const std::exception& e) {
         logger_.log_error(std::string("STOP ERROR: ") + e.what());
         notify_error(std::string("STOP ERROR: ") + e.what());
@@ -606,6 +676,13 @@ void ExperimentRunner::send_stop() {
 void ExperimentRunner::log_console(const std::string& msg) {
     if (callbacks_.console) callbacks_.console(msg);
     logger_.log_event(msg);
+}
+
+void ExperimentRunner::log_console_quiet(const std::string& msg) {
+    if (callbacks_.console) callbacks_.console(msg);
+    // Skips the CSV event row. The in-memory ring is still appended to so the
+    // metadata JSON shows the recent timeline.
+    logger_.log_console_only(msg);
 }
 
 void ExperimentRunner::notify_error(const std::string& msg) {

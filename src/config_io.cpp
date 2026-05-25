@@ -47,6 +47,18 @@ int parse_int(const std::string& raw, const std::string& key) {
     return static_cast<int>(v);
 }
 
+// Parses a UDP port number with proper range validation. The previous
+// implementation cast directly to uint16_t before checking, so an out-of-range
+// value (e.g. 70000) silently wrapped to a plausible-looking port and gave
+// the operator no warning that the requested target was nonsense.
+uint16_t parse_port(const std::string& raw, const std::string& key) {
+    const int v = parse_int(raw, key);
+    if (v < 1 || v > 65535) {
+        throw std::invalid_argument(key + " must be between 1 and 65535: " + raw);
+    }
+    return static_cast<uint16_t>(v);
+}
+
 TempChannel temp_channel_from_string(const std::string& raw) {
     const auto v = lower(trim(raw));
     if (v == "t1" || v == "0") return TempChannel::T1;
@@ -87,6 +99,7 @@ void parse_kv(Config& c, const std::string& key_raw, const std::string& value) {
     else if (key == "max_temp_rate_c_per_s") c.max_temp_rate_c_per_s = parse_double(value, key);
     else if (key == "temp_channel_fallback") c.temp_channel_fallback = parse_bool(value, key);
     else if (key == "temperature_enabled") c.temperature_enabled = parse_bool(value, key);
+    else if (key == "temperature_required") c.temperature_required = parse_bool(value, key);
     else if (key == "pid_enabled") c.pid_enabled = parse_bool(value, key);
     else if (key == "pid_setpoint") c.pid_setpoint = parse_double(value, key);
     else if (key == "pid_amplitude") c.pid_amplitude = parse_bool(value, key);
@@ -114,7 +127,7 @@ void parse_kv(Config& c, const std::string& key_raw, const std::string& value) {
     else if (key == "com11_port") c.com11_port = trim(value);
     else if (key == "temp_channel") c.temp_channel = temp_channel_from_string(value);
     else if (key == "udp_host") c.udp_host = trim(value);
-    else if (key == "udp_port") c.udp_port = static_cast<uint16_t>(parse_int(value, key));
+    else if (key == "udp_port") c.udp_port = parse_port(value, key);
     else if (key == "simulate_temp") c.simulate_temp = parse_bool(value, key);
     else if (key == "simulate_us") c.simulate_us = parse_bool(value, key);
     else if (key == "persistent_com3") c.persistent_com3 = parse_bool(value, key);
@@ -123,6 +136,23 @@ void parse_kv(Config& c, const std::string& key_raw, const std::string& value) {
     else if (key == "communication_retry_initial_backoff_ms") c.communication_retry_initial_backoff_ms = parse_int(value, key);
     else if (key == "emergency_stop_repeats") c.emergency_stop_repeats = parse_int(value, key);
     else if (key == "watchdog_timeout_ms") c.watchdog_timeout_ms = parse_int(value, key);
+    else if (key == "web_server_port") c.web_server_port = parse_port(value, key);
+    else if (key == "web_server_snapshot_interval_s") {
+        const int v = parse_int(value, key);
+        if (v < 5 || v > 3600) throw std::invalid_argument(key + " must be between 5 and 3600 seconds: " + value);
+        c.web_server_snapshot_interval_s = v;
+    }
+    else if (key == "web_server_lan") c.web_server_lan = parse_bool(value, key);
+    else if (key == "web_server_enabled") {
+        // Session-only. Accepted on read for backwards compatibility with
+        // hand-edited config files but the value is DISCARDED — never copied
+        // into the Config struct. Defence-in-depth: a future code path that
+        // mistakenly honored c.web_server_enabled couldn't be triggered by a
+        // shared .config opening a LAN-reachable endpoint on launch.
+        // parse_bool() is still called so a malformed value (e.g. "yes-ish")
+        // surfaces as a config error rather than silently passing.
+        (void)parse_bool(value, key);
+    }
     else if (key == "config_source_type" || key == "config_file_path") {
         // Runtime provenance is set by the loader/UI, not trusted from file content.
     } else {
@@ -195,6 +225,7 @@ std::string config_to_text(const Config& c, bool include_comments) {
     write_num(os, "max_temp_rate_c_per_s", c.max_temp_rate_c_per_s);
     write_bool(os, "temp_channel_fallback", c.temp_channel_fallback);
     write_bool(os, "temperature_enabled", c.temperature_enabled);
+    write_bool(os, "temperature_required", c.temperature_required);
     os << '\n';
 
     os << "[pid_tau_only]\n";
@@ -240,6 +271,14 @@ std::string config_to_text(const Config& c, bool include_comments) {
     write_int(os, "communication_retry_initial_backoff_ms", c.communication_retry_initial_backoff_ms);
     write_int(os, "emergency_stop_repeats", c.emergency_stop_repeats);
     write_int(os, "watchdog_timeout_ms", c.watchdog_timeout_ms);
+    os << '\n';
+
+    // Web server: port, snapshot interval, and LAN-bind flag persist; the
+    // enable flag is deliberately session-only (see config.hpp).
+    os << "[web_server]\n";
+    write_int(os, "web_server_port", static_cast<int>(c.web_server_port));
+    write_int(os, "web_server_snapshot_interval_s", c.web_server_snapshot_interval_s);
+    write_bool(os, "web_server_lan", c.web_server_lan);
     return os.str();
 }
 

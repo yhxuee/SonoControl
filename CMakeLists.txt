@@ -73,6 +73,29 @@ if (SONOCONTROL_BUILD_GUI)
         endif()
     endif()
 
+    # Qt Network is OPTIONAL — only required for the in-app monitoring web
+    # server. Some MinGW Qt installs (including older snapshots of qtbase) do
+    # not ship the Network module; the rest of the GUI must keep building.
+    # When found we set SONOCONTROL_WEB_SERVER=1 and add web_server.cpp to the
+    # sources; main_gui.cpp guards every reference to the WebServer class
+    # behind that define so the symbol is genuinely absent on builds without
+    # the module instead of being declared-but-not-linked.
+    set(SONOCONTROL_HAS_NETWORK FALSE)
+    set(QT_NETWORK_LIB "")
+    if (Qt6_FOUND)
+        find_package(Qt6 COMPONENTS Network QUIET)
+        if (Qt6Network_FOUND)
+            set(QT_NETWORK_LIB Qt6::Network)
+            set(SONOCONTROL_HAS_NETWORK TRUE)
+        endif()
+    elseif (Qt5_FOUND)
+        find_package(Qt5 COMPONENTS Network QUIET)
+        if (Qt5Network_FOUND)
+            set(QT_NETWORK_LIB Qt5::Network)
+            set(SONOCONTROL_HAS_NETWORK TRUE)
+        endif()
+    endif()
+
     if (QT_WIDGETS_LIB)
         # Fail early if CLion/CMake mixes incompatible Windows ABIs, for example
         # MSVC cl.exe + Qt mingw_64, or MinGW g++ + Qt msvc2022_64.
@@ -85,8 +108,17 @@ if (SONOCONTROL_BUILD_GUI)
         endif()
 
         set(CMAKE_AUTOMOC ON)
-        add_executable(sonocontrol_gui src/gui/main_gui.cpp)
-        target_link_libraries(sonocontrol_gui PRIVATE sonocontrol_core ${QT_WIDGETS_LIB})
+        set(SONOCONTROL_GUI_SOURCES src/gui/main_gui.cpp)
+        if (SONOCONTROL_HAS_NETWORK)
+            list(APPEND SONOCONTROL_GUI_SOURCES src/gui/web_server.cpp)
+        else()
+            message(WARNING "Qt Network was not found. The GUI will build, but the in-app monitoring web server will be disabled at compile time. Install Qt's Network module to enable it.")
+        endif()
+        add_executable(sonocontrol_gui ${SONOCONTROL_GUI_SOURCES})
+        target_link_libraries(sonocontrol_gui PRIVATE sonocontrol_core ${QT_WIDGETS_LIB} ${QT_NETWORK_LIB})
+        if (SONOCONTROL_HAS_NETWORK)
+            target_compile_definitions(sonocontrol_gui PRIVATE SONOCONTROL_WEB_SERVER=1)
+        endif()
         set_target_properties(sonocontrol_gui PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
             RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_BINARY_DIR}/bin"

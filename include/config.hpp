@@ -5,6 +5,16 @@
 
 namespace sonocontrol {
 
+// Wall-clock floor for `interval_time_s`. Each transmit cycle sends a serial
+// CFREQ/PRF/DUR triple (each followed by the hardware-required 100 ms COM
+// gap) plus the 4096-datagram UDP waveform burst; the end-to-end time is
+// ~0.3–0.5 s on a healthy local link. A smaller interval cannot make the
+// next cycle start any sooner — it just causes cycles to overrun their
+// scheduled slot and stretches the run beyond the configured total. Both
+// the GUI's validate_config and the CLI's validate_config clamp to this
+// value so a config file, CLI flag, and GUI spinbox cannot disagree.
+inline constexpr double kMinIntervalTimeS = 0.2;
+
 enum class WaveShape { Sine, Square, Triangle };
 enum class TempChannel { T1 = 0, T2 = 1, Average = 2 };
 enum class CoolingMode { Stop, Low };
@@ -47,6 +57,13 @@ struct Config {
     // not opened and temperature sampling/cutoff are skipped. PID requires
     // temperature_enabled=true and preflight must verify a valid sensor read.
     bool temperature_enabled = false;
+    // Fail-closed: when true, sustained loss of the temperature sensor
+    // (3 consecutive invalid samples in non-PID mode) aborts the run instead
+    // of silently disabling monitoring and continuing ultrasound. PID and
+    // hold-after-target already abort by construction (they require the
+    // sensor); this flag extends the same behavior to monitoring-only runs
+    // where the operator has explicitly committed to a temperature limit.
+    bool temperature_required = false;
 
     bool pid_enabled = false;
     double pid_setpoint = 40.0;
@@ -95,6 +112,16 @@ struct Config {
     // Configuration provenance; written to CSV/meta logs.
     std::string config_source_type = "gui-default";
     std::string config_file_path;
+
+    // Optional in-app monitoring web server. The `enabled` flag is session-
+    // only — explicitly NOT serialized into .config files, so loading a
+    // shared config can never silently expose the machine on a network. Port,
+    // snapshot interval, and LAN-bind flag are persisted because a setup of
+    // {port=50896, interval=15 min, lan=off} is a fine recurring default.
+    bool web_server_enabled = false;
+    uint16_t web_server_port = 50896;
+    int web_server_snapshot_interval_s = 900;  // 15 minutes; see kMinIntervalTimeS-style rationale in README
+    bool web_server_lan = false;               // false = bind 127.0.0.1; true = bind all interfaces
 };
 
 struct ActiveParams {

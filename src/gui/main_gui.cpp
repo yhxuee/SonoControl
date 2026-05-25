@@ -7,12 +7,17 @@
 #include "serial_port.hpp"
 #include "udp_socket.hpp"
 
+#if SONOCONTROL_WEB_SERVER
+#include "web_server.hpp"
+#endif
+
 #include <QtCore/QDateTime>
 #include <QtCore/QDir>
 #include <QtCore/QElapsedTimer>
 #include <QtCore/QFile>
 #include <QtCore/QIODevice>
 #include <QtCore/QMetaType>
+#include <QtCore/QMimeData>
 #include <QtCore/QMutex>
 #include <QtCore/QSignalBlocker>
 #include <QtCore/QTime>
@@ -22,8 +27,14 @@
 #include <QtCore/QThread>
 #include <QtCore/QRegularExpression>
 #include <QtCore/QTimer>
+#include <QtGui/QClipboard>
 #include <QtGui/QCloseEvent>
 #include <QtGui/QDesktopServices>
+#include <QtGui/QDragEnterEvent>
+#include <QtGui/QDragMoveEvent>
+#include <QtGui/QDropEvent>
+#include <QtGui/QIntValidator>
+#include <QtGui/QKeyEvent>
 #include <QtGui/QPainter>
 #include <QtGui/QPen>
 #include <QtGui/QPixmap>
@@ -44,6 +55,7 @@
 #include <QtWidgets/QHBoxLayout>
 #include <QtWidgets/QLabel>
 #include <QtWidgets/QLineEdit>
+#include <QtWidgets/QListWidget>
 #include <QtWidgets/QMainWindow>
 #include <QtWidgets/QMenuBar>
 #include <QtGui/QAction>
@@ -118,7 +130,13 @@ void validate_config(sonocontrol::Config& c) {
     c.amplitude = std::clamp(c.amplitude, 0.0, 1.0);
     c.duty_cycle = std::clamp(c.duty_cycle, 0.0, 1.0);
     c.duration_ms = std::max(0, c.duration_ms);
-    c.interval_time_s = std::max(c.interval_time_s, static_cast<double>(c.duration_ms) / 1000.0);
+    // Interval floor — see sonocontrol::kMinIntervalTimeS in config.hpp.
+    // The CLI's validate_config applies the same clamp to config-file and
+    // --interval-s values, so the GUI spinbox limit and the headless paths
+    // can't drift.
+    c.interval_time_s = std::max({c.interval_time_s,
+                                  static_cast<double>(c.duration_ms) / 1000.0,
+                                  sonocontrol::kMinIntervalTimeS});
     c.sampling_rate_hz = std::max(0.1, c.sampling_rate_hz);
     c.total_duration_mins = std::max(0.0, c.total_duration_mins);
     c.repeating = std::max(1, c.repeating);
@@ -198,14 +216,13 @@ public:
     void setLines(double setpoint, double cutoff) { setpoint_ = setpoint; cutoff_ = cutoff; scheduleRepaint(); }
     void append(double t, double t1, double t2, double avg) {
         times_.push_back(t); t1_.push_back(t1); t2_.push_back(t2); avg_.push_back(avg);
-        constexpr size_t kMaxPlotPoints = 6000;
-        constexpr size_t kTrimPlotPoints = 600;
-        if (times_.size() > kMaxPlotPoints) {
-            times_.erase(times_.begin(), times_.begin() + kTrimPlotPoints);
-            t1_.erase(t1_.begin(), t1_.begin() + kTrimPlotPoints);
-            t2_.erase(t2_.begin(), t2_.begin() + kTrimPlotPoints);
-            avg_.erase(avg_.begin(), avg_.begin() + kTrimPlotPoints);
-        }
+        // Keep every sample for the full experiment so long runs do not lose
+        // history. The painter already downsamples to ~1200 points for drawing
+        // (see `step` in paintEvent), so memory — not draw time — is the only
+        // cost of holding the full series. At 2 Hz that is ~173 k samples per
+        // 24 h, ≈ 5.5 MB across the four vectors. Importing a CSV log relies
+        // on this too: previously the buffer cap silently dropped older rows
+        // and only the tail of the file was plotted.
         scheduleRepaint();
     }
 private:
@@ -361,6 +378,139 @@ protected:
     }
 private:
     std::vector<float> data_;
+};
+
+// Apple-style PIN code entry: a row of N separate digit boxes (visible
+// digits, no echo masking). Each box accepts one digit; entering one auto-
+// advances focus to the next; Backspace on an empty box jumps back and
+// clears the previous digit; arrow keys navigate; paste fills as many
+// boxes as the clipboard provides. Two sizes — compact for inline forms
+// (preflight) and "large" for the stop confirmation dialog.
+class PinEntry final : public QWidget {
+    Q_OBJECT
+public:
+    explicit PinEntry(int digits, bool large, QWidget* parent = nullptr)
+        : QWidget(parent) {
+        auto* h = new QHBoxLayout(this);
+        h->setContentsMargins(0, 0, 0, 0);
+        h->setSpacing(large ? 12 : 8);
+        h->setAlignment(Qt::AlignCenter);
+        boxes_.reserve(static_cast<size_t>(digits));
+        const int side = large ? 64 : 40;
+        const int radius = large ? 14 : 10;
+        const int fontPx = large ? 32 : 22;
+        const QString style = QString(
+            "QLineEdit { background:#ffffff; color:#101828; border:1px solid #d0d5dd; "
+            "border-radius:%1px; padding:0; min-width:%2px; max-width:%2px; "
+            "min-height:%2px; max-height:%2px; font-size:%3px; font-weight:600; }"
+            "QLineEdit:focus { border:2px solid #00897b; }"
+            "QLineEdit:disabled { background:#f3f5f8; color:#98a2b3; }"
+        ).arg(radius).arg(side).arg(fontPx);
+        for (int i = 0; i < digits; ++i) {
+            auto* e = new QLineEdit;
+            e->setMaxLength(1);
+            e->setValidator(new QIntValidator(0, 9, e));
+            e->setAlignment(Qt::AlignCenter);
+            e->setStyleSheet(style);
+            // Visible digits — explicitly NOT password mode. Operators
+            // and the lab partner standing next to them both need to see
+            // the digits when shouting the PIN across the bench.
+            e->setEchoMode(QLineEdit::Normal);
+            e->installEventFilter(this);
+            connect(e, &QLineEdit::textChanged, this, [this, i](const QString& s) { onTextChanged(i, s); });
+            h->addWidget(e);
+            boxes_.push_back(e);
+        }
+    }
+
+    QString pin() const {
+        QString s;
+        for (auto* b : boxes_) s += b->text();
+        return s;
+    }
+
+    void clearPin() {
+        for (auto* b : boxes_) b->clear();
+        focusFirst();
+    }
+
+    void setFromString(const QString& src) {
+        for (auto* b : boxes_) b->clear();
+        int wrote = 0;
+        for (int i = 0; i < src.size() && wrote < static_cast<int>(boxes_.size()); ++i) {
+            if (src[i].isDigit()) {
+                boxes_[static_cast<size_t>(wrote)]->setText(QString(src[i]));
+                ++wrote;
+            }
+        }
+        if (wrote < static_cast<int>(boxes_.size())) {
+            boxes_[static_cast<size_t>(wrote)]->setFocus();
+        } else if (!boxes_.empty()) {
+            boxes_.back()->setFocus();
+        }
+    }
+
+    void focusFirst() {
+        for (auto* b : boxes_) {
+            if (b->text().isEmpty()) { b->setFocus(); return; }
+        }
+        if (!boxes_.empty()) boxes_.back()->setFocus();
+    }
+
+    void setEntryEnabled(bool on) {
+        for (auto* b : boxes_) b->setEnabled(on);
+    }
+
+signals:
+    void changed();
+    // Emitted once when the final digit completes the code. Useful for
+    // auto-submit, but the dialog still requires an explicit OK click to
+    // commit so a mistyped digit can be corrected before submission.
+    void completed(const QString& pin);
+
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override {
+        if (event->type() == QEvent::KeyPress) {
+            auto* ke = static_cast<QKeyEvent*>(event);
+            for (size_t i = 0; i < boxes_.size(); ++i) {
+                if (watched != boxes_[i]) continue;
+                if (ke->key() == Qt::Key_Backspace && boxes_[i]->text().isEmpty() && i > 0) {
+                    boxes_[i - 1]->setFocus();
+                    boxes_[i - 1]->clear();
+                    return true;
+                }
+                if (ke->key() == Qt::Key_Left && i > 0) {
+                    boxes_[i - 1]->setFocus();
+                    return true;
+                }
+                if (ke->key() == Qt::Key_Right && i + 1 < boxes_.size()) {
+                    boxes_[i + 1]->setFocus();
+                    return true;
+                }
+                if (ke->matches(QKeySequence::Paste)) {
+                    setFromString(QApplication::clipboard()->text());
+                    return true;
+                }
+                break;
+            }
+        }
+        return QWidget::eventFilter(watched, event);
+    }
+
+private:
+    void onTextChanged(int i, const QString& s) {
+        if (!s.isEmpty() && i + 1 < static_cast<int>(boxes_.size())) {
+            boxes_[static_cast<size_t>(i) + 1]->setFocus();
+            boxes_[static_cast<size_t>(i) + 1]->selectAll();
+        }
+        emit changed();
+        const QString full = pin();
+        if (full.size() == static_cast<int>(boxes_.size())) {
+            emit completed(full);
+        }
+    }
+
+    std::vector<QLineEdit*> boxes_;
 };
 
 class RunnerWorker final : public QObject {
@@ -537,6 +687,588 @@ private:
     std::atomic<bool> paused_{false};
 };
 
+// One entry in the experiment sequence: a parsed Config plus the file path it
+// was loaded from. The path is kept only for display; once the sequence is
+// armed it operates on the parsed Config and is not re-read at run time, so a
+// user editing the file mid-sequence cannot change a queued experiment.
+struct SequenceItem {
+    QString path;
+    sonocontrol::Config cfg;
+};
+
+// Scrollable container that accepts external file drops (drag-and-drop of
+// .config files from Explorer). Internal row reordering is handled by per-row
+// up/down buttons instead of QListWidget DnD, because the sequence layout
+// interleaves intervals between configs and dragging a row would otherwise
+// have ambiguous semantics with respect to the surrounding interval boxes.
+//
+// Important Qt subtlety: QScrollArea's `viewport()` is a plain QWidget that
+// does NOT have acceptDrops set by default, and Qt only delivers drag/drop
+// events to widgets that explicitly accept them. Setting setAcceptDrops(true)
+// on the QScrollArea alone is therefore *insufficient* — drops on the visible
+// scroll area would silently be rejected because they're targeted at the
+// viewport. We work around this by enabling drops on the viewport too and
+// installing an event filter that hoists the drag/drop events back up to the
+// QScrollArea-level overrides.
+class SequenceDropArea final : public QScrollArea {
+    Q_OBJECT
+public:
+    explicit SequenceDropArea(QWidget* parent = nullptr) : QScrollArea(parent) {
+        setAcceptDrops(true);
+        setWidgetResizable(true);
+        viewport()->setAcceptDrops(true);
+        viewport()->installEventFilter(this);
+    }
+signals:
+    void filesDropped(const QStringList& paths);
+protected:
+    bool eventFilter(QObject* obj, QEvent* ev) override {
+        if (obj == viewport()) {
+            switch (ev->type()) {
+                case QEvent::DragEnter:
+                case QEvent::DragMove: {
+                    auto* de = static_cast<QDragMoveEvent*>(ev);  // QDragEnter inherits from QDragMove
+                    if (de->mimeData() && de->mimeData()->hasUrls()) {
+                        de->acceptProposedAction();
+                        return true;
+                    }
+                    break;
+                }
+                case QEvent::Drop: {
+                    auto* de = static_cast<QDropEvent*>(ev);
+                    if (de->mimeData() && de->mimeData()->hasUrls()) {
+                        QStringList paths;
+                        for (const QUrl& url : de->mimeData()->urls()) {
+                            const QString local = url.toLocalFile();
+                            if (!local.isEmpty()) paths << local;
+                        }
+                        if (!paths.isEmpty()) {
+                            de->acceptProposedAction();
+                            emit filesDropped(paths);
+                            return true;
+                        }
+                    }
+                    break;
+                }
+                default: break;
+            }
+        }
+        return QScrollArea::eventFilter(obj, ev);
+    }
+    void dragEnterEvent(QDragEnterEvent* e) override {
+        if (e->mimeData() && e->mimeData()->hasUrls()) { e->acceptProposedAction(); return; }
+        QScrollArea::dragEnterEvent(e);
+    }
+    void dragMoveEvent(QDragMoveEvent* e) override {
+        if (e->mimeData() && e->mimeData()->hasUrls()) { e->acceptProposedAction(); return; }
+        QScrollArea::dragMoveEvent(e);
+    }
+    void dropEvent(QDropEvent* e) override {
+        if (e->mimeData() && e->mimeData()->hasUrls()) {
+            QStringList paths;
+            for (const QUrl& url : e->mimeData()->urls()) {
+                const QString local = url.toLocalFile();
+                if (!local.isEmpty()) paths << local;
+            }
+            if (!paths.isEmpty()) { e->acceptProposedAction(); emit filesDropped(paths); return; }
+        }
+        QScrollArea::dropEvent(e);
+    }
+};
+
+class SonoControlWindow;
+
+// Modeless dialog for building and running an experiment sequence.
+//
+// State model:
+//   items_           — N configurations in execution order.
+//   intervalMinutes_ — N-1 entries (or 0 if N<2). intervalMinutes_[k] is the
+//                      gap that runs AFTER items_[k] finishes and BEFORE
+//                      items_[k+1] starts. Units are minutes; range 0..600.
+//
+// The list area is rebuilt from these two arrays on every structural change
+// (add / remove / reorder). The interval QSpinBoxes are owned by the
+// rebuilt widgets — their valueChanged signal writes back into
+// intervalMinutes_ without triggering a rebuild, so typing inside an
+// interval box does not lose focus.
+class SequenceDialog final : public QDialog {
+    Q_OBJECT
+public:
+    explicit SequenceDialog(QWidget* parent = nullptr);
+
+    // Seed the UI from previously-saved sequence state on the parent window
+    // (so closing+reopening the dialog preserves the queue).
+    void seedState(const QList<SequenceItem>& items, const QList<int>& intervalsMin);
+    QList<SequenceItem> items() const { return items_; }
+    QList<int> intervalsMinutes() const { return intervalMinutes_; }
+    bool pinEnabled() const { return chkPin_ && chkPin_->isChecked(); }
+    QString pinUsername() const { return txtUser_ ? txtUser_->text().trimmed() : QString(); }
+    QString pinValue() const { return pinEntry_ ? pinEntry_->pin() : QString(); }
+    bool stopOnError() const { return chkStopOnError_ && chkStopOnError_->isChecked(); }
+
+    // Called by SonoControlWindow as the run progresses. Purely visual.
+    void setRunningState(bool active);
+    void setStatusText(const QString& text);
+    void setCurrentIndex(int idx);          // -1 when no item is currently active
+    void setSequenceFinished(bool ok);
+
+signals:
+    void startRequested();
+    void stopRequested();
+
+private:
+    static constexpr int kDefaultIntervalMin = 5;
+    static constexpr int kMaxIntervalMin = 600;
+
+    void rebuild();
+    void importPaths(const QStringList& paths);
+    void onAddFiles();
+    void onClearAll();
+    void onStartClicked();
+    void onStopClicked();
+    void removeItemAt(int i);
+    void moveItemUp(int i);
+    void moveItemDown(int i);
+    void recomputeTotal();
+    static QString itemDetail(const SequenceItem& it);
+    static bool configIsTargetHold(const sonocontrol::Config& c) {
+        return c.length_mode == sonocontrol::LengthMode::HoldAfterTarget;
+    }
+    static double configDurationSeconds(const sonocontrol::Config& c) {
+        if (c.length_mode == sonocontrol::LengthMode::TotalDuration) return c.total_duration_mins * 60.0;
+        if (c.length_mode == sonocontrol::LengthMode::RepeatingCycles) return static_cast<double>(c.repeating) * c.interval_time_s;
+        return 0.0;
+    }
+
+    QList<SequenceItem> items_;
+    QList<int> intervalMinutes_;
+    bool running_ = false;
+    int currentIdx_ = -1;
+
+    SequenceDropArea* scroll_ = nullptr;
+    QWidget* listContainer_ = nullptr;
+    QVBoxLayout* listLayout_ = nullptr;
+    QLabel* lblTotalTime_ = nullptr;
+    QLabel* lblStatus_ = nullptr;
+    QPushButton* btnAdd_ = nullptr;
+    QPushButton* btnClear_ = nullptr;
+    QPushButton* btnStart_ = nullptr;
+    QPushButton* btnStop_ = nullptr;
+    QCheckBox* chkPin_ = nullptr;
+    QLineEdit* txtUser_ = nullptr;
+    PinEntry* pinEntry_ = nullptr;
+    QLabel* pinErr_ = nullptr;
+    QCheckBox* chkStopOnError_ = nullptr;
+};
+
+SequenceDialog::SequenceDialog(QWidget* parent) : QDialog(parent) {
+    setWindowTitle("Experiment Sequence");
+    setModal(false);
+    setMinimumSize(1100, 760);
+    resize(1180, 820);
+    auto* root = new QVBoxLayout(this);
+    root->setContentsMargins(20, 18, 20, 16);
+    root->setSpacing(12);
+
+    auto* title = new QLabel("Experiment Sequence");
+    title->setStyleSheet("font-size:20px; font-weight:700;");
+    root->addWidget(title);
+
+    auto* hint = new QLabel("Drag .config files into the area below, or click \"Add Configs…\". Set the interval (in minutes, up to 600) between each pair of configurations independently. Each entry runs as an independent experiment and produces its own log file.");
+    hint->setWordWrap(true);
+    hint->setStyleSheet("color:#475467; font-size:12px;");
+    root->addWidget(hint);
+
+    auto* addRow = new QHBoxLayout;
+    btnAdd_ = new QPushButton("Add Configs…");
+    btnClear_ = new QPushButton("Clear");
+    btnAdd_->setMinimumWidth(140);
+    btnClear_->setMinimumWidth(120);
+    addRow->addWidget(btnAdd_);
+    addRow->addWidget(btnClear_);
+    addRow->addStretch();
+    root->addLayout(addRow);
+
+    scroll_ = new SequenceDropArea;
+    scroll_->setMinimumHeight(300);
+    listContainer_ = new QWidget;
+    listLayout_ = new QVBoxLayout(listContainer_);
+    listLayout_->setContentsMargins(8, 8, 8, 8);
+    listLayout_->setSpacing(6);
+    scroll_->setWidget(listContainer_);
+    root->addWidget(scroll_, 1);
+
+    lblTotalTime_ = new QLabel("Estimated total: —");
+    lblTotalTime_->setStyleSheet("color:#475467; font-size:12px;");
+    root->addWidget(lblTotalTime_);
+
+    chkStopOnError_ = new QCheckBox("Abort the rest of the sequence if a configuration fails (safety cutoff, hardware error, or watchdog stop)");
+    chkStopOnError_->setToolTip("When checked, the sequence stops after any non-clean exit. When unchecked (the default), the queue keeps advancing — useful for fire-and-forget unattended runs where a single bad config shouldn't kill the batch.");
+    root->addWidget(chkStopOnError_);
+
+    auto* pinGrp = new QGroupBox("Manual-stop PIN protection (sequence)");
+    auto* pinGrid = new QGridLayout(pinGrp);
+    pinGrid->setHorizontalSpacing(14);
+    pinGrid->setVerticalSpacing(10);
+    chkPin_ = new QCheckBox("Require username + 4-digit PIN to stop this sequence manually");
+    auto* lblUser = new QLabel("Username");
+    txtUser_ = new QLineEdit;
+    txtUser_->setMaxLength(48);
+    txtUser_->setPlaceholderText("e.g. Lab Operator");
+    auto* lblPin = new QLabel("4-digit PIN");
+    pinEntry_ = new PinEntry(4, /*large=*/false);
+    pinErr_ = new QLabel(" ");
+    pinErr_->setStyleSheet("color:#d93025; font-size:12px;");
+    auto* pinNote = new QLabel("If enabled, the sequence STOP button requires the PIN. There is no preflight confirmation window for sequences.");
+    pinNote->setWordWrap(true);
+    pinNote->setStyleSheet("color:#667085; font-size:12px;");
+    pinGrid->addWidget(chkPin_, 0, 0, 1, 2);
+    pinGrid->addWidget(lblUser, 1, 0);
+    pinGrid->addWidget(txtUser_, 1, 1);
+    pinGrid->addWidget(lblPin, 2, 0);
+    pinGrid->addWidget(pinEntry_, 2, 1, Qt::AlignLeft);
+    pinGrid->addWidget(pinErr_, 3, 0, 1, 2);
+    pinGrid->addWidget(pinNote, 4, 0, 1, 2);
+    root->addWidget(pinGrp);
+
+    auto setPinFieldsEnabled = [this, lblUser, lblPin](bool on) {
+        for (auto* w : std::initializer_list<QWidget*>{lblUser, txtUser_, lblPin}) w->setEnabled(on);
+        pinEntry_->setEntryEnabled(on);
+    };
+    setPinFieldsEnabled(false);
+    connect(chkPin_, &QCheckBox::toggled, this, [setPinFieldsEnabled](bool on){ setPinFieldsEnabled(on); });
+    connect(txtUser_, &QLineEdit::textEdited, this, [this](const QString&){ pinErr_->setText(" "); });
+    connect(pinEntry_, &PinEntry::changed, this, [this]{ pinErr_->setText(" "); });
+
+    lblStatus_ = new QLabel("Idle. Add at least one configuration to start.");
+    lblStatus_->setStyleSheet("font-size:12px; color:#475467;");
+    lblStatus_->setWordWrap(true);
+    root->addWidget(lblStatus_);
+
+    auto* btnRow = new QHBoxLayout;
+    btnStart_ = new QPushButton(" ▶  Start Sequence ");
+    btnStart_->setObjectName("start");
+    btnStart_->setMinimumWidth(180);
+    btnStop_ = new QPushButton(" ■  Stop Sequence ");
+    btnStop_->setObjectName("stop");
+    btnStop_->setMinimumWidth(180);
+    btnStop_->setEnabled(false);
+    auto* btnClose = new QPushButton("Close");
+    btnRow->addStretch();
+    btnRow->addWidget(btnStart_);
+    btnRow->addWidget(btnStop_);
+    btnRow->addWidget(btnClose);
+    root->addLayout(btnRow);
+
+    connect(btnAdd_, &QPushButton::clicked, this, &SequenceDialog::onAddFiles);
+    connect(btnClear_, &QPushButton::clicked, this, &SequenceDialog::onClearAll);
+    connect(scroll_, &SequenceDropArea::filesDropped, this, &SequenceDialog::importPaths);
+    connect(btnStart_, &QPushButton::clicked, this, &SequenceDialog::onStartClicked);
+    connect(btnStop_, &QPushButton::clicked, this, &SequenceDialog::onStopClicked);
+    connect(btnClose, &QPushButton::clicked, this, &QDialog::hide);
+
+    rebuild();
+}
+
+void SequenceDialog::seedState(const QList<SequenceItem>& items, const QList<int>& intervalsMin) {
+    items_ = items;
+    intervalMinutes_ = intervalsMin;
+    // Normalize: intervalMinutes_ must have exactly max(0, N-1) entries.
+    const int wanted = std::max(0, static_cast<int>(items_.size()) - 1);
+    while (intervalMinutes_.size() < wanted) intervalMinutes_.append(kDefaultIntervalMin);
+    while (intervalMinutes_.size() > wanted) intervalMinutes_.removeLast();
+    for (int& v : intervalMinutes_) v = std::clamp(v, 0, kMaxIntervalMin);
+    rebuild();
+}
+
+void SequenceDialog::rebuild() {
+    // Clear existing rows.
+    while (auto* it = listLayout_->takeAt(0)) {
+        if (auto* w = it->widget()) w->deleteLater();
+        delete it;
+    }
+
+    // Normalize intervalMinutes_ length to N-1.
+    const int wanted = std::max(0, static_cast<int>(items_.size()) - 1);
+    while (intervalMinutes_.size() < wanted) intervalMinutes_.append(kDefaultIntervalMin);
+    while (intervalMinutes_.size() > wanted) intervalMinutes_.removeLast();
+
+    if (items_.isEmpty()) {
+        auto* empty = new QLabel("Drop .config files here, or click \"Add Configs…\".");
+        empty->setAlignment(Qt::AlignCenter);
+        empty->setStyleSheet("color:#98a2b3; font-size:13px; padding:60px; background:transparent;");
+        listLayout_->addWidget(empty);
+        listLayout_->addStretch();
+        if (btnStart_ && !running_) btnStart_->setEnabled(false);
+        recomputeTotal();
+        return;
+    }
+
+    // Per-row icon-button stylesheet. The main window's global QPushButton
+    // rule sets padding:5px 14px / min-height:28px, which on a small fixed-
+    // size button squashes the glyph to invisibility. The local stylesheet
+    // here forces the size explicitly via min/max-width/height plus zero
+    // padding, so the arrows and × render at their intended pixel size.
+    const QString iconBtnSs =
+        "QPushButton {"
+        " padding:0; margin:0;"
+        " min-width:38px; max-width:38px;"
+        " min-height:34px; max-height:34px;"
+        " font-family:'Segoe UI Symbol','Segoe UI',Arial,sans-serif;"
+        " font-size:18px; font-weight:700;"
+        " background:#ffffff; color:#1a1a2e;"
+        " border:1px solid #c0c8d4; border-radius:6px; }"
+        "QPushButton:hover { background:#e8f5f3; border-color:#00897b; color:#00695c; }"
+        "QPushButton:pressed { background:#d3eee8; }"
+        "QPushButton:disabled { color:#cbd5e1; background:#f9fafb; border-color:#e4e7ec; }";
+    const QString removeBtnSs = iconBtnSs +
+        "QPushButton { color:#b42318; }"
+        "QPushButton:hover { color:#ffffff; background:#b42318; border-color:#b42318; }"
+        "QPushButton:disabled { color:#fca5a5; }";
+
+    for (int i = 0; i < items_.size(); ++i) {
+        const QString cardBg = (running_ && i == currentIdx_) ? "#e6f4ea"
+                                : (running_ && i < currentIdx_) ? "#f3f5f8"
+                                : "#ffffff";
+        const QString cardFg = (running_ && i < currentIdx_) ? "#98a2b3" : "#1a1a2e";
+        const QString detailFg = (running_ && i < currentIdx_) ? "#98a2b3" : "#475467";
+        auto* card = new QFrame;
+        card->setStyleSheet(QString(
+            "QFrame { background:%1; color:%2; border:1px solid #d0d5dd; border-radius:8px; }"
+        ).arg(cardBg, cardFg));
+        auto* h = new QHBoxLayout(card);
+        h->setContentsMargins(14, 8, 12, 8);
+        h->setSpacing(10);
+
+        // Text column: two lines so the file name and the parameter detail
+        // don't compete for one row of horizontal space.
+        auto* textCol = new QVBoxLayout;
+        textCol->setSpacing(2);
+        auto* titleLbl = new QLabel(QString("%1.  %2")
+                                        .arg(i + 1, 2, 10, QChar(' '))
+                                        .arg(QFileInfo(items_[i].path).fileName()));
+        titleLbl->setStyleSheet(QString("background:transparent; border:none; color:%1; "
+                                        "font-family:'Segoe UI',Arial,sans-serif; "
+                                        "font-size:13px; font-weight:600;").arg(cardFg));
+        titleLbl->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        auto* detailLbl = new QLabel(itemDetail(items_[i]));
+        detailLbl->setStyleSheet(QString("background:transparent; border:none; color:%1; "
+                                         "font-family:Consolas,monospace; font-size:11px;").arg(detailFg));
+        detailLbl->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        textCol->addWidget(titleLbl);
+        textCol->addWidget(detailLbl);
+        h->addLayout(textCol, 1);
+
+        auto* btnUp = new QPushButton(QString::fromUtf8("\xE2\x86\x91"));  // ↑
+        btnUp->setStyleSheet(iconBtnSs);
+        btnUp->setEnabled(!running_ && i > 0);
+        btnUp->setToolTip("Move up");
+        connect(btnUp, &QPushButton::clicked, this, [this, i]{ moveItemUp(i); });
+        h->addWidget(btnUp);
+
+        auto* btnDown = new QPushButton(QString::fromUtf8("\xE2\x86\x93"));  // ↓
+        btnDown->setStyleSheet(iconBtnSs);
+        btnDown->setEnabled(!running_ && i + 1 < items_.size());
+        btnDown->setToolTip("Move down");
+        connect(btnDown, &QPushButton::clicked, this, [this, i]{ moveItemDown(i); });
+        h->addWidget(btnDown);
+
+        auto* btnRemove = new QPushButton(QString::fromUtf8("\xC3\x97"));  // ×
+        btnRemove->setStyleSheet(removeBtnSs);
+        btnRemove->setEnabled(!running_);
+        btnRemove->setToolTip("Remove");
+        connect(btnRemove, &QPushButton::clicked, this, [this, i]{ removeItemAt(i); });
+        h->addWidget(btnRemove);
+
+        listLayout_->addWidget(card);
+
+        // Interval row — only between two configurations.
+        if (i + 1 < items_.size()) {
+            auto* gap = new QWidget;
+            auto* gl = new QHBoxLayout(gap);
+            gl->setContentsMargins(40, 0, 0, 0);
+            gl->setSpacing(8);
+            auto* arrow = new QLabel("↓");
+            arrow->setStyleSheet("background:transparent; color:#98a2b3; font-size:18px; font-weight:700;");
+            auto* lbl = new QLabel("Interval");
+            lbl->setStyleSheet("background:transparent; color:#475467; font-size:12px;");
+            auto* spn = new QSpinBox;
+            spn->setRange(0, kMaxIntervalMin);
+            spn->setSuffix(" min");
+            spn->setValue(intervalMinutes_[i]);
+            spn->setEnabled(!running_);
+            spn->setMinimumWidth(120);
+            // Capture by value so the lambda doesn't read a stale i if the
+            // list is rebuilt while the spin box is destroyed; the spin box's
+            // signal is disconnected on deleteLater() before any stale fire.
+            connect(spn, qOverload<int>(&QSpinBox::valueChanged), this, [this, i](int v){
+                if (i >= 0 && i < intervalMinutes_.size()) intervalMinutes_[i] = std::clamp(v, 0, kMaxIntervalMin);
+                recomputeTotal();
+            });
+            gl->addWidget(arrow);
+            gl->addWidget(lbl);
+            gl->addWidget(spn);
+            gl->addStretch();
+            listLayout_->addWidget(gap);
+        }
+    }
+    listLayout_->addStretch();
+    if (btnStart_ && !running_) btnStart_->setEnabled(!items_.isEmpty());
+    recomputeTotal();
+}
+
+void SequenceDialog::importPaths(const QStringList& paths) {
+    if (running_) return;
+    QStringList failed;
+    for (const QString& path : paths) {
+        try {
+            auto cfg = sonocontrol::load_config_file(path.toStdString());
+            SequenceItem item;
+            item.path = path;
+            item.cfg = cfg;
+            items_.push_back(item);
+            // Add a default interval entry whenever the count crosses into N>=2.
+            if (items_.size() >= 2) intervalMinutes_.push_back(kDefaultIntervalMin);
+        } catch (const std::exception& e) {
+            failed << QString("%1: %2").arg(QFileInfo(path).fileName()).arg(QString::fromUtf8(e.what()));
+        }
+    }
+    if (!failed.isEmpty()) {
+        QMessageBox::warning(this, "Some Configs Failed", "The following files could not be loaded:\n\n" + failed.join("\n"));
+    }
+    rebuild();
+}
+
+void SequenceDialog::onAddFiles() {
+    const QStringList paths = QFileDialog::getOpenFileNames(this, "Add Configurations to Sequence", QString(), "SonoControl Config (*.config);;All Files (*)");
+    if (paths.isEmpty()) return;
+    importPaths(paths);
+}
+
+void SequenceDialog::onClearAll() {
+    if (running_) return;
+    items_.clear();
+    intervalMinutes_.clear();
+    rebuild();
+}
+
+void SequenceDialog::removeItemAt(int i) {
+    if (running_) return;
+    if (i < 0 || i >= items_.size()) return;
+    items_.removeAt(i);
+    // Drop the interval AFTER the removed item if it exists; otherwise drop
+    // the last (which was BEFORE it, i.e. the only neighbour left).
+    if (i < intervalMinutes_.size()) intervalMinutes_.removeAt(i);
+    else if (!intervalMinutes_.isEmpty()) intervalMinutes_.removeLast();
+    rebuild();
+}
+
+void SequenceDialog::moveItemUp(int i) {
+    if (running_) return;
+    if (i <= 0 || i >= items_.size()) return;
+    items_.swapItemsAt(i, i - 1);
+    if (i - 1 < intervalMinutes_.size() && i < intervalMinutes_.size()) intervalMinutes_.swapItemsAt(i - 1, i);
+    rebuild();
+}
+
+void SequenceDialog::moveItemDown(int i) {
+    if (running_) return;
+    if (i < 0 || i + 1 >= items_.size()) return;
+    items_.swapItemsAt(i, i + 1);
+    if (i < intervalMinutes_.size() && i + 1 < intervalMinutes_.size()) intervalMinutes_.swapItemsAt(i, i + 1);
+    rebuild();
+}
+
+void SequenceDialog::recomputeTotal() {
+    if (!lblTotalTime_) return;
+    if (items_.isEmpty()) { lblTotalTime_->setText("Estimated total: —"); return; }
+    bool anyTargetHold = false;
+    double sumS = 0.0;
+    for (const auto& it : items_) {
+        if (configIsTargetHold(it.cfg)) { anyTargetHold = true; break; }
+        sumS += configDurationSeconds(it.cfg);
+    }
+    if (anyTargetHold) {
+        lblTotalTime_->setText("Estimated total: unavailable (after-target hold mode is used)");
+        return;
+    }
+    int intervalSumMin = 0;
+    for (int v : intervalMinutes_) intervalSumMin += v;
+    const double totalS = sumS + static_cast<double>(intervalSumMin) * 60.0;
+    lblTotalTime_->setText(QString("Estimated total: %1 (%2 experiment(s), %3 gap(s) totalling %4 min)")
+                              .arg(fmt_time(totalS))
+                              .arg(items_.size())
+                              .arg(intervalMinutes_.size())
+                              .arg(intervalSumMin));
+}
+
+void SequenceDialog::onStartClicked() {
+    pinErr_->setText(" ");
+    if (items_.isEmpty()) { setStatusText("Add at least one configuration before starting."); return; }
+    if (chkPin_->isChecked()) {
+        const QString user = txtUser_->text().trimmed();
+        if (user.isEmpty()) { pinErr_->setText("Enter a username (shown on the stop prompt)."); txtUser_->setFocus(); return; }
+        static const QRegularExpression kPinPattern("^[0-9]{4}$");
+        if (!kPinPattern.match(pinEntry_->pin()).hasMatch()) { pinErr_->setText("Enter all 4 digits of the PIN."); pinEntry_->focusFirst(); return; }
+    }
+    emit startRequested();
+}
+
+void SequenceDialog::onStopClicked() { emit stopRequested(); }
+
+void SequenceDialog::setRunningState(bool active) {
+    running_ = active;
+    btnAdd_->setEnabled(!active);
+    btnClear_->setEnabled(!active);
+    chkPin_->setEnabled(!active);
+    txtUser_->setEnabled(!active && chkPin_->isChecked());
+    pinEntry_->setEntryEnabled(!active && chkPin_->isChecked());
+    if (chkStopOnError_) chkStopOnError_->setEnabled(!active);
+    btnStart_->setEnabled(!active && !items_.isEmpty());
+    btnStop_->setEnabled(active);
+    rebuild();
+}
+
+void SequenceDialog::setStatusText(const QString& text) {
+    if (lblStatus_) lblStatus_->setText(text);
+}
+
+void SequenceDialog::setCurrentIndex(int idx) {
+    currentIdx_ = idx;
+    rebuild();
+}
+
+void SequenceDialog::setSequenceFinished(bool ok) {
+    currentIdx_ = -1;
+    setRunningState(false);
+    setStatusText(ok ? "Sequence finished." : "Sequence stopped.");
+}
+
+QString SequenceDialog::itemDetail(const SequenceItem& it) {
+    QString modeStr;
+    QString length;
+    switch (it.cfg.length_mode) {
+        case sonocontrol::LengthMode::TotalDuration:
+            modeStr = "TotalDur";
+            length = QString::number(it.cfg.total_duration_mins, 'f', 1) + " min";
+            break;
+        case sonocontrol::LengthMode::RepeatingCycles:
+            modeStr = "Repeat";
+            length = QString("%1 × %2 s").arg(it.cfg.repeating).arg(it.cfg.interval_time_s, 0, 'f', 2);
+            break;
+        case sonocontrol::LengthMode::HoldAfterTarget:
+            modeStr = "Hold";
+            length = QString::number(it.cfg.hold_after_target_mins, 'f', 1) + " min (after target)";
+            break;
+    }
+    return QString("%1  ·  %2  ·  amp=%3  ·  dur=%4 ms  ·  intv=%5 s")
+        .arg(modeStr)
+        .arg(length)
+        .arg(it.cfg.amplitude, 0, 'f', 3)
+        .arg(it.cfg.duration_ms)
+        .arg(it.cfg.interval_time_s, 0, 'f', 2);
+}
+
 class SonoControlWindow final : public QMainWindow {
     Q_OBJECT
 public:
@@ -578,11 +1310,22 @@ public:
         // force_stop that cancels pending I/O so the worker can exit.
         watchdogTimer_.setInterval(1000);
         connect(&watchdogTimer_, &QTimer::timeout, this, &SonoControlWindow::checkWorkerProgress);
+
+        // Sequence interval timer: fires once after the configured gap to
+        // launch the next configuration. Single-shot is set explicitly each
+        // time it is armed in handleSequenceItemFinished().
+        sequenceIntervalTimer_.setSingleShot(true);
+        connect(&sequenceIntervalTimer_, &QTimer::timeout, this, &SonoControlWindow::onSequenceIntervalElapsed);
     }
 
     ~SonoControlWindow() override {
         shutdownInProgress_ = true;
+        sequenceActive_ = false;
+        sequenceIntervalTimer_.stop();
         teardownStatusProbe();
+#if SONOCONTROL_WEB_SERVER
+        if (webServer_) webServer_->stop();
+#endif
         stopWorker(true);
         deleteTemporaryConfigFile();
     }
@@ -590,7 +1333,12 @@ public:
 protected:
     void closeEvent(QCloseEvent* e) override {
         shutdownInProgress_ = true;
+        sequenceActive_ = false;
+        sequenceIntervalTimer_.stop();
         teardownStatusProbe();
+#if SONOCONTROL_WEB_SERVER
+        if (webServer_) webServer_->stop();
+#endif
         stopWorker(true);
         deleteTemporaryConfigFile();
         QMainWindow::closeEvent(e);
@@ -599,10 +1347,20 @@ protected:
 private slots:
     void onStart() {
         if (running_) return;
+        if (sequenceActive_) return;  // main Start is disabled while a sequence is queued, but guard regardless
         config_ = buildConfig();
         attachActiveConfigProvenance(config_);
         validate_config(config_);
         if (!preflightCheck(config_)) return;
+        launchWorkerForConfig(config_, /*fromSequence=*/false);
+    }
+
+    // Shared worker setup used by both onStart (with preflight) and the
+    // sequence runner (which skips the preflight confirmation window but
+    // still relies on this method to wire up the QThread + signals exactly
+    // the same way).
+    void launchWorkerForConfig(const sonocontrol::Config& cfg, bool fromSequence) {
+        config_ = cfg;
         fatalErrorShown_ = false;
         running_ = true;
         targetHoldMode_ = (config_.length_mode == sonocontrol::LengthMode::HoldAfterTarget);
@@ -620,22 +1378,41 @@ private slots:
         tempPlot_->clear();
         tempPlot_->setLines(spnSetpoint_->value(), spnCutoff_->value());
         idleTimer_.stop();
-        btnStart_->setEnabled(false);
-        btnStop_->setEnabled(true);
-        // Reset the emergency-stop button to its graceful state for this run.
-        btnStop_->setText(" ■  EMERGENCY STOP ");
+        // In sequence mode the main Start/Stop stay locked out for the full
+        // duration of the sequence; the sequence dialog provides its own
+        // buttons. Outside sequence mode this is just the usual per-run
+        // disable.
+        if (!sequenceActive_) {
+            btnStart_->setEnabled(false);
+            btnStop_->setEnabled(true);
+            btnStop_->setText(" ■  EMERGENCY STOP ");
+        }
         lblCycle_->setText("IDLE");
-        appendConsole("=== Experiment started ===");
-        statusBar()->showMessage("Experiment running");
+        if (fromSequence) {
+            appendConsole(QString("=== [Sequence %1/%2] Experiment started ===")
+                              .arg(sequenceIndex_ + 1).arg(sequenceTotal_));
+            statusBar()->showMessage(QString("Sequence %1/%2 running")
+                                         .arg(sequenceIndex_ + 1).arg(sequenceTotal_));
+        } else {
+            appendConsole("=== Experiment started ===");
+            statusBar()->showMessage("Experiment running");
+        }
 
-        // Hand the ports over to the worker; pause idle probing so we don't
-        // race for COM3 / HH806AU. The probe will resume when running_ flips
-        // back to false in onFinished().
         if (probe_) probe_->setPaused(true);
 
-        // Initialize the watchdog timestamp and start the timer. The watchdog
-        // is independent of the experiment thread — it lives on the GUI
-        // thread and checks elapsed time since the last worker signal.
+#if SONOCONTROL_WEB_SERVER
+        if (webServer_) {
+            // The real session id is created on the worker thread inside
+            // ExperimentRunner::run() → logger.start_session(), so we can't
+            // know it here. Start with an empty id; touchWorkerSignal()
+            // backfills the canonical logger id as soon as the first
+            // worker-side signal arrives. This keeps the web page session_id
+            // strictly aligned with the on-disk CSV/JSON filename instead of
+            // a GUI-side approximation that drifted by a few ms.
+            webServer_->onRunStarted(QString());
+        }
+#endif
+
         lastWorkerSignalMs_ = QDateTime::currentMSecsSinceEpoch();
         workerStallNotified_ = false;
         watchdogTimer_.start();
@@ -660,9 +1437,14 @@ private slots:
     }
 
     void onStop() {
+        if (!worker_) return;
+        if (pendingPinEnabled_ && !promptForStopPin()) {
+            appendConsole(">>> Manual stop cancelled (PIN not confirmed)");
+            statusBar()->showMessage("Manual stop cancelled");
+            return;
+        }
         appendConsole(">>> EMERGENCY STOP requested");
         statusBar()->showMessage("Emergency stop requested");
-        if (!worker_) return;
         worker_->stop();
         // Visually mark the button as already pressed and disable a second
         // graceful click — the next click should be the user explicitly
@@ -687,9 +1469,81 @@ private slots:
     // graceful attempt timed out — at this point we go straight to force_stop.
     void onForceStop() {
         if (!worker_) return;
+        if (pendingPinEnabled_ && !promptForStopPin()) {
+            appendConsole(">>> Force-stop cancelled (PIN not confirmed)");
+            statusBar()->showMessage("Force-stop cancelled");
+            return;
+        }
         appendConsole(">>> User requested force-stop");
         worker_->forceStop();
         btnStop_->setEnabled(false);
+    }
+
+    // Opens a modal prompt that shows the current operator name and demands
+    // the 4-digit PIN configured at preflight. Returns true only on an exact
+    // match. The 2 s graceful->force escalation and the watchdog do not call
+    // this — they bypass the PIN so safety paths cannot be locked out.
+    bool promptForStopPin() {
+        QDialog dlg(this);
+        dlg.setWindowTitle("Confirm Manual Stop");
+        dlg.setModal(true);
+        dlg.setMinimumWidth(440);
+        auto* v = new QVBoxLayout(&dlg);
+        v->setContentsMargins(36, 28, 36, 22);
+        v->setSpacing(14);
+
+        auto* title = new QLabel("Stop experiment?");
+        title->setAlignment(Qt::AlignCenter);
+        title->setStyleSheet("font-size:22px; font-weight:700;");
+        v->addWidget(title);
+
+        auto* who = new QLabel(QString("Current user: <b>%1</b>").arg(pendingPinUsername_.toHtmlEscaped()));
+        who->setTextFormat(Qt::RichText);
+        who->setAlignment(Qt::AlignCenter);
+        who->setStyleSheet("font-size:14px; color:#344054;");
+        v->addWidget(who);
+
+        auto* prompt = new QLabel("Enter the 4-digit PIN to stop the experiment");
+        prompt->setAlignment(Qt::AlignCenter);
+        prompt->setStyleSheet("font-size:13px; color:#475467;");
+        v->addWidget(prompt);
+
+        v->addSpacing(4);
+        auto* pinEntry = new PinEntry(4, /*large=*/true);
+        v->addWidget(pinEntry, 0, Qt::AlignCenter);
+
+        auto* err = new QLabel(" ");
+        err->setAlignment(Qt::AlignCenter);
+        err->setStyleSheet("color:#d93025; font-size:12px; min-height:18px;");
+        v->addWidget(err);
+
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+        auto* okBtn = buttons->button(QDialogButtonBox::Ok);
+        okBtn->setText("Stop");
+        okBtn->setEnabled(false);
+        v->addWidget(buttons);
+
+        // Enable Stop only when all four digits are present.
+        connect(pinEntry, &PinEntry::changed, okBtn, [pinEntry, okBtn, err]() {
+            okBtn->setEnabled(pinEntry->pin().size() == 4);
+            err->setText(" ");
+        });
+        // Pressing the last digit submits via the same path as clicking Stop.
+        connect(pinEntry, &PinEntry::completed, okBtn, [okBtn]() {
+            if (okBtn->isEnabled()) okBtn->animateClick();
+        });
+
+        connect(buttons, &QDialogButtonBox::accepted, &dlg, [&, pinEntry, err]() {
+            if (pinEntry->pin() != pendingPin_) {
+                err->setText("Incorrect PIN.");
+                pinEntry->clearPin();
+                return;
+            }
+            dlg.accept();
+        });
+        connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        pinEntry->focusFirst();
+        return dlg.exec() == QDialog::Accepted;
     }
 
     void loadConfigFile() {
@@ -758,18 +1612,24 @@ private slots:
         running_ = false;
         worker_ = nullptr;
         workerThread_ = nullptr;
-        btnStart_->setEnabled(true);
-        btnStop_->setEnabled(false);
-        // Restore the EMERGENCY STOP label for the next run, in case a
-        // force-stop escalation re-labelled it during this one.
-        btnStop_->setText(" ■  EMERGENCY STOP ");
-        // Resume idle probing now that the worker has released the ports.
-        // setPaused(false) also kicks off a probe immediately so the pills
-        // reflect the post-run state without waiting for the next tick.
+        if (!sequenceActive_) {
+            btnStart_->setEnabled(true);
+            btnStop_->setEnabled(false);
+            btnStop_->setText(" ■  EMERGENCY STOP ");
+        }
+        // Resume idle probing now that the worker has released the ports. In
+        // sequence mode the next item will pause it again moments later, but
+        // resuming it here keeps the pills accurate during the inter-config
+        // interval.
         if (probe_ && !shutdownInProgress_) probe_->setPaused(false);
         lblCycle_->setText(code == 0 ? "COMPLETE" : (code == 2 ? "CUTOFF" : (code == 3 ? "STOPPED" : "ERROR")));
         lblCycle_->setStyleSheet(valueStyle(code == 0 ? "#00897b" : (code == 3 ? "#b54708" : (code == 2 ? "#d93025" : "#b42318"))));
-        if (code == 0) {
+        if (sequenceActive_) {
+            const int oneBased = sequenceIndex_ + 1;
+            const QString verb = (code == 0) ? "complete" : (code == 2 ? "stopped by safety cutoff" : (code == 3 ? "stopped manually" : "aborted"));
+            appendConsole(QString("=== [Sequence %1/%2] Experiment %3 ===").arg(oneBased).arg(sequenceTotal_).arg(verb));
+            statusBar()->showMessage(QString("Sequence %1/%2: %3").arg(oneBased).arg(sequenceTotal_).arg(verb));
+        } else if (code == 0) {
             appendConsole("=== Experiment complete ===");
             statusBar()->showMessage("Experiment complete");
         } else if (code == 2) {
@@ -786,7 +1646,22 @@ private slots:
         if (code == 0) {
             lastAutoSaveDir_ = autosaveExperimentArtifacts();
         }
-        showExperimentSummary(code);
+        // Drop the manual-stop PIN so it does not leak across runs. The
+        // sequence's own PIN lives in separate members and is not affected.
+        pendingPinEnabled_ = false;
+        pendingPinUsername_.clear();
+        pendingPin_.clear();
+#if SONOCONTROL_WEB_SERVER
+        if (webServer_) webServer_->onRunFinished(code);
+#endif
+        if (sequenceActive_) {
+            // The summary popup would interrupt the inter-config gap on every
+            // item, which defeats the point of an unattended sequence. The
+            // dialog status label carries the equivalent information.
+            handleSequenceItemFinished(code);
+        } else {
+            showExperimentSummary(code);
+        }
         // idleTimer_ no longer used
     }
 
@@ -823,10 +1698,19 @@ private slots:
         if (ref_valid) {
             lblTavg_->setText(QString::number(ref, 'f', 2) + QString::fromUtf8("°C"));
             if (running_ && startWall_.isValid()) {
-                tempPlot_->append(startWall_.elapsed() / 1000.0,
+                const double t_s = startWall_.elapsed() / 1000.0;
+                tempPlot_->append(t_s,
                                   has_t1 ? t1 : std::numeric_limits<double>::quiet_NaN(),
                                   has_t2 ? t2 : std::numeric_limits<double>::quiet_NaN(),
                                   ref);
+#if SONOCONTROL_WEB_SERVER
+                if (webServer_) {
+                    webServer_->onSampleAvailable(t_s,
+                        has_t1 ? t1 : std::numeric_limits<double>::quiet_NaN(),
+                        has_t2 ? t2 : std::numeric_limits<double>::quiet_NaN(),
+                        ref);
+                }
+#endif
             }
         } else {
             lblTavg_->setText("N/C");
@@ -847,6 +1731,9 @@ private slots:
 
     void onTimeUpdate(double elapsed, double remaining) {
         touchWorkerSignal();
+#if SONOCONTROL_WEB_SERVER
+        if (webServer_) webServer_->onTimesUpdated(elapsed, remaining);
+#endif
         // Worker-thread time updates are kept for CLI/log compatibility,
         // but the GUI display is driven by sessionUiTimer_ to avoid visible stalls
         // when hardware transmission or retries briefly block the experiment thread.
@@ -1099,18 +1986,28 @@ private slots:
             QMessageBox::warning(this, "Import Error", "CSV file has no data rows.");
             return;
         }
+        // Header is read by name (not by position) so both the legacy schema
+        // and the extended schema (with phase/setpoint_C/pid_demand_pct/
+        // us_active appended at the end) are accepted unchanged: extra
+        // columns are simply ignored, and a setpoint column is honoured for
+        // the dashed reference line if it exists.
         const QStringList header = lines.first().split(',');
         auto idx = [&](const QString& name) { return header.indexOf(name); };
         const int iTime = idx("time_s");
         const int iT1 = idx("T1_C");
         const int iT2 = idx("T2_C");
         const int iTemp = idx("temp_C");
+        const int iSetpoint = idx("setpoint_C");  // -1 on legacy CSVs
         if (iTime < 0 || iTemp < 0) {
             QMessageBox::warning(this, "Import Error", "CSV must contain at least time_s and temp_C columns.");
             return;
         }
         tempPlot_->clear();
-        tempPlot_->setLines(spnSetpoint_->value(), spnCutoff_->value());
+        // Pick up the recorded setpoint for the dashed reference line so the
+        // plot reflects the imported run instead of whatever the GUI happens
+        // to have configured right now. The cutoff temperature is not a
+        // per-sample column in either schema — keep the live GUI value for it.
+        double importedSetpoint = std::numeric_limits<double>::quiet_NaN();
         int count = 0;
         for (int r = 1; r < lines.size(); ++r) {
             const QStringList cols = lines[r].split(',');
@@ -1122,10 +2019,22 @@ private slots:
             if (iT1 >= 0 && cols.size() > iT1) t1 = cols[iT1].trimmed().toDouble(&okT1);
             if (iT2 >= 0 && cols.size() > iT2) t2 = cols[iT2].trimmed().toDouble(&okT2);
             if (!okTime || !okTemp) continue;
+            if (iSetpoint >= 0 && cols.size() > iSetpoint && std::isnan(importedSetpoint)) {
+                bool okSp = false;
+                const double sp = cols[iSetpoint].trimmed().toDouble(&okSp);
+                if (okSp) importedSetpoint = sp;
+            }
             tempPlot_->append(ts, okT1 ? t1 : 0.0, okT2 ? t2 : 0.0, temp);
             ++count;
         }
-        appendConsole(QString("Imported log for plotting: %1 (%2 samples)").arg(path).arg(count));
+        // Apply the reference line AFTER the loop so the imported setpoint
+        // (if any) replaces the GUI value; otherwise fall back to GUI.
+        tempPlot_->setLines(std::isnan(importedSetpoint) ? spnSetpoint_->value() : importedSetpoint,
+                            spnCutoff_->value());
+        appendConsole(QString("Imported log for plotting: %1 (%2 samples%3)")
+                          .arg(path)
+                          .arg(count)
+                          .arg(std::isnan(importedSetpoint) ? QString() : QString(", setpoint=%1°C").arg(importedSetpoint, 0, 'f', 2)));
         statusBar()->showMessage(QString("Imported %1 samples from log").arg(count));
     }
 
@@ -1140,16 +2049,167 @@ private slots:
     }
 
     void showReadme() {
-        QMessageBox::information(this, "SonoControl Readme",
-            "PID parameters\n\n"
-            "Kp: proportional gain. Higher Kp reacts more strongly to temperature error. Increase if the system is too slow; decrease if it overshoots or oscillates.\n\n"
-            "Ki: integral gain. It removes long-term offset, but too much Ki causes delayed overshoot. For 1 mL wells, start very small or zero.\n\n"
-            "Kd: derivative gain. It suppresses rapid temperature rise. Too much Kd can make output noisy or overly conservative.\n\n"
-            "Tau: liquid thermal time constant used by the prediction model T_future = T + tau*dT/dt*(1-exp(-t1/tau)). Larger tau brakes earlier; smaller tau behaves closer to ordinary PID. Tau=0 disables prediction.\n\n"
-            "CONNECT page\n\n"
-            "Scan Ports refreshes available serial ports. COM3 is the ultrasound controller port. UDP Host and UDP Port are the waveform target. The HH806AU section connects the temperature meter; select T1, T2, or Average. Use Test before running PID. Temperature monitoring is required for PID and after-target hold mode.\n\n"
-            "Configuration\n\n"
-            "Use File > Load Configuration and File > Save Configuration for .config files. Edit > Set Auto-save Directory stores the default completed-experiment output folder in the .config file. File > Import Log File loads a CSV log and redraws the temperature plot.");
+        QDialog dlg(this);
+        dlg.setWindowTitle("SonoControl — Readme");
+        dlg.setModal(true);
+        dlg.resize(720, 640);
+        auto* layout = new QVBoxLayout(&dlg);
+
+        auto* title = new QLabel("SonoControl quick reference");
+        title->setStyleSheet("font-size:18px; font-weight:700;");
+        layout->addWidget(title);
+
+        auto* body = new QPlainTextEdit;
+        body->setReadOnly(true);
+        body->setStyleSheet("font-family:'Segoe UI',Arial,sans-serif; font-size:13px;");
+        body->setPlainText(
+            "PID parameters\n"
+            "──────────────\n"
+            "Kp  Proportional gain. Higher = stronger reaction to error. Raise if response is too slow; lower if it overshoots or oscillates.\n"
+            "Ki  Integral gain. Removes long-term offset; too much causes delayed overshoot. For small (≈1 mL) wells start at zero or near-zero.\n"
+            "Kd  Derivative gain. Suppresses rapid rises; too much makes output noisy.\n"
+            "Thermal const (tau)  Liquid time constant for the predictive model T_future = T + τ·dT/dt·(1 − e^(−t/τ)). Larger τ brakes earlier; τ = 0 disables prediction.\n"
+            "Prediction horizon  Lookahead in seconds. 0 = use the current hardware interval.\n"
+            "\n"
+            "Experiment length modes\n"
+            "───────────────────────\n"
+            "Total Duration    Wall-clock minutes; supports temperature cycling.\n"
+            "Repeating Cycles  Fixed number of burst-interval cycles. Disabled when PID is enabled.\n"
+            "After-target Hold Starts the hold timer the first time the channel temperature reaches setpoint ± tolerance. Requires temperature monitoring.\n"
+            "\n"
+            "Cycling (Total Duration mode only)\n"
+            "──────────────────────────────────\n"
+            "Heating / Cooling phases are entered in minutes. Each phase is capped at the configured Total Duration. Cooling mode is either Stop (ultrasound off) or Hold (PID maintains a lower setpoint).\n"
+            "\n"
+            "Manual-stop PIN protection\n"
+            "──────────────────────────\n"
+            "The Preflight Confirmation dialog has an optional username + 4-digit PIN. When enabled, the manual STOP button asks for the PIN before stopping. The Sequence dialog has its own equivalent PIN that gates the sequence STOP button independently. In both cases the 2-second force-stop escalation and the stall watchdog still bypass the prompt so safety paths cannot be locked out.\n"
+            "\n"
+            "Sequence (Edit → Sequence…)\n"
+            "───────────────────────────\n"
+            "Queue multiple .config files to run back-to-back as independent experiments. Drag files from Explorer or click \"Add Configs…\". Reorder with the ↑/↓ buttons; remove a row with ×. Each pair of adjacent configurations has its own \"Interval\" spin box (minutes, 0–600) — the gap that runs after one experiment finishes and before the next starts. The estimated total adds every configuration's duration plus every gap; it shows \"unavailable\" when any queued config uses after-target hold (the hold timer can't be predicted). Each entry produces its own timestamped CSV/JSON log under ./logs, exactly as a single run would. The sequence has its own START / STOP buttons; main page START is disabled while a sequence is queued. No preflight confirmation window is shown for sequence runs.\n"
+            "\n"
+            "CONNECT tab\n"
+            "───────────\n"
+            "Scan Ports refreshes serial port discovery. COM3 = ultrasound controller, UDP host/port = waveform target. The HH806AU section connects the dual-channel thermocouple meter; pick T1, T2, or Average. Use Test before running PID. Temperature monitoring is mandatory for PID and After-target Hold.\n"
+            "\n"
+            "Configuration files\n"
+            "───────────────────\n"
+            "File → Save Configuration / Load Configuration use a UTF-8 .config file. Edit → Set Auto-save Directory stores the default completed-experiment output folder. Edit → Sequence opens the experiment-sequence dialog. File → Import Log File loads a CSV log and redraws the temperature plot, picking up the recorded setpoint as the reference line when present.\n"
+            "\n"
+            "Logging\n"
+            "───────\n"
+            "Streaming CSV log per session under ./logs/<timestamp>_log.csv; metadata JSON next to it; auto-saved bundle under ./experiments/<session>/ (or your configured auto-save directory) on clean completion. The HH806AU raw log rotates daily as hh806au_raw_YYYYMMDD.log. Sequence runs do not create a separate log type — every queued configuration writes its own session log just like a normal single run."
+        );
+        layout->addWidget(body, 1);
+
+        auto* close = new QDialogButtonBox(QDialogButtonBox::Close);
+        connect(close, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        connect(close, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        layout->addWidget(close);
+        dlg.exec();
+    }
+
+    void showAboutDialog() {
+        QDialog dlg(this);
+        dlg.setWindowTitle("About SonoControl");
+        dlg.setModal(true);
+        dlg.resize(620, 640);
+        auto* layout = new QVBoxLayout(&dlg);
+        layout->setContentsMargins(20, 20, 20, 16);
+        layout->setSpacing(10);
+
+        auto* name = new QLabel("SonoControl");
+        name->setStyleSheet("font-size:24px; font-weight:800;");
+        layout->addWidget(name);
+
+        auto* tagline = new QLabel("Ultrasound thermal controller — desktop application driving an FPGA ultrasound device with PID-regulated temperature feedback.");
+        tagline->setWordWrap(true);
+        tagline->setStyleSheet("font-size:13px; color:#475467;");
+        layout->addWidget(tagline);
+
+        auto* versionRow = new QLabel(QString("Version %1   ·   Qt %2   ·   %3 build")
+            .arg(QApplication::applicationVersion())
+            .arg(qstr(qVersion()))
+            .arg(debug_sim_build() ? "Debug (simulation enabled)" : "Release"));
+        versionRow->setStyleSheet("font-size:12px; color:#667085;");
+        layout->addWidget(versionRow);
+
+        auto* sep1 = new QFrame; sep1->setFrameShape(QFrame::HLine); sep1->setStyleSheet("color:#e4e7ec;");
+        layout->addWidget(sep1);
+
+        auto* sectionsLbl = new QLabel("What's in this build");
+        sectionsLbl->setStyleSheet("font-size:14px; font-weight:700; letter-spacing:0.4px;");
+        layout->addWidget(sectionsLbl);
+
+        auto* body = new QPlainTextEdit;
+        body->setReadOnly(true);
+        body->setStyleSheet("font-family:'Segoe UI',Arial,sans-serif; font-size:12px;");
+        body->setPlainText(
+            "Experiment control\n"
+            "  • Ultrasound amplitude, carrier frequency, PRF, duty cycle, duration, interval\n"
+            "  • Sine / square / triangle waveforms over a 4096-sample DDS table (UDP)\n"
+            "  • Length modes: Total Duration, Repeating Cycles, After-target Hold\n"
+            "  • Temperature cycling (heating / cooling, in minutes, capped at total duration)\n"
+            "  • PID with predictive thermal model T_future = T + τ·dT/dt·(1 − e^(−t/τ))\n"
+            "  • Configurable safety cutoff with debounce (N samples, min spacing)\n"
+            "\n"
+            "Experiment Sequence (Edit → Sequence…)\n"
+            "  • Queue multiple .config files; each runs back-to-back as an independent experiment\n"
+            "  • Drag-and-drop import from Explorer, or manual file picker; ↑/↓/× per row to reorder\n"
+            "  • Per-gap interval in minutes (0–600), edited inline between every adjacent pair\n"
+            "  • Estimated total time computed from each config's duration + every gap (shown\n"
+            "    as 'unavailable' when any queued config uses after-target hold)\n"
+            "  • Independent START / STOP for the sequence; main page buttons lock out while a\n"
+            "    sequence is queued; sequence STOP has its own PIN protection\n"
+            "  • No preflight confirmation window for sequence runs; each queued config writes\n"
+            "    its own session log — no separate sequence log type\n"
+            "\n"
+            "Hardware\n"
+            "  • Ultrasound FPGA: COM3 9600 8N1 control + UDP 4096-sample waveform table\n"
+            "  • Omega HH806AU dual-channel thermocouple meter: COM5 19200 8E1\n"
+            "  • Persistent COM3, exponential-backoff retry, force-stop cancels pending I/O\n"
+            "\n"
+            "Safety & operations\n"
+            "  • Manual-stop PIN protection (username + 4-digit PIN, per-run and per-sequence)\n"
+            "  • Stall watchdog: auto-escalates to force-stop after configurable timeout\n"
+            "  • Status pills (COM3 / UDP / Temp) updated by a background probe — never blocks the UI\n"
+            "  • Auto-theme: dark mode 17:00–08:00 by default\n"
+            "\n"
+            "Logging\n"
+            "  • Streaming CSV per session with per-sample columns: T1, T2, temperature,\n"
+            "    full ultrasound params, plus phase, setpoint, PID demand %, US active\n"
+            "  • Metadata JSON with bounded event/error ring (no unbounded growth)\n"
+            "  • HH806AU raw diagnostic log rotates daily and coalesces repeats\n"
+            "  • CSV import accepts both the new schema and the legacy schema\n"
+            "  • Sequence runs produce one independent session log per queued configuration\n"
+            "\n"
+            "Long-run optimizations in this build\n"
+            "  • Plot retains the full session — paint downsamples for display\n"
+            "  • Cached UDP destination and waveform preview avoid per-packet rebuilds\n"
+            "  • Larger CSV streambuf and decoupled meta-rewrite cadence\n"
+            "  • Errors flush CSV and metadata immediately\n"
+            "\n"
+            "Credits\n"
+            "  • SonoControl is provided as-is for research use.\n"
+            "  • Built with Qt Widgets, C++17, CMake."
+        );
+        layout->addWidget(body, 1);
+
+        auto* pathsLbl = new QLabel(QString("Logs folder:   %1\nAuto-save:     %2")
+            .arg(qstr(logger_.log_dir().string()))
+            .arg(autoSaveDir_.isEmpty() ? QString("(default ./experiments/<session>)") : autoSaveDir_));
+        pathsLbl->setStyleSheet("font-family:Consolas,monospace; font-size:11px; color:#475467;");
+        pathsLbl->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        layout->addWidget(pathsLbl);
+
+        auto* btns = new QDialogButtonBox(QDialogButtonBox::Close);
+        auto* openLogsBtn = btns->addButton("Open Log Folder", QDialogButtonBox::ActionRole);
+        connect(openLogsBtn, &QPushButton::clicked, this, &SonoControlWindow::openLogs);
+        connect(btns, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        connect(btns, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        layout->addWidget(btns);
+        dlg.exec();
     }
 
     void toggleConsole(bool v) { consoleFrame_->setVisible(v); }
@@ -1468,10 +2528,18 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         auto* edit = menuBar()->addMenu("Edit");
         auto* actAutoSaveDir = edit->addAction("Set Auto-save Directory...");
         connect(actAutoSaveDir, &QAction::triggered, this, &SonoControlWindow::setAutoSaveDirectory);
+        edit->addSeparator();
+        auto* actSequence = edit->addAction("Sequence...");
+        connect(actSequence, &QAction::triggered, this, &SonoControlWindow::openSequenceDialog);
 
         auto* about = menuBar()->addMenu("About");
         auto* actReadme = about->addAction("Readme");
+        auto* actAbout = about->addAction("About SonoControl...");
+        about->addSeparator();
+        auto* actOpenLogs = about->addAction("Open Log Folder");
         connect(actReadme, &QAction::triggered, this, &SonoControlWindow::showReadme);
+        connect(actAbout, &QAction::triggered, this, &SonoControlWindow::showAboutDialog);
+        connect(actOpenLogs, &QAction::triggered, this, &SonoControlWindow::openLogs);
     }
 
     void buildUi() {
@@ -1554,7 +2622,11 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         cmbWave_ = new QComboBox; cmbWave_->addItems({"Sine","Square","Triangle"});
         addRow(g,0,"Amplitude",spnAmp_,"(0–1)"); addRow(g,1,"CFreq",spnCfreq_,"kHz"); addRow(g,2,"PRF",spnPrf_,"Hz"); addRow(g,3,"Duty Cycle",spnDuty_,"%"); addRow(g,4,"Waveform",cmbWave_,""); v->addWidget(us);
         auto* timing = new QGroupBox("Timing"); auto* gt = new QGridLayout(timing);
-        spnDuration_ = dspin(10.0,60000.0,1000.0,0,100.0); spnInterval_ = dspin(0.01,3600.0,5.0,2,0.5); spnSampleRate_ = dspin(0.1,20.0,2.0,1,0.5);
+        // Interval lower bound is sonocontrol::kMinIntervalTimeS (see the
+        // header for rationale: serial CFREQ/PRF/DUR with the hardware
+        // 100 ms COM gap each + 4096 UDP datagrams). Preflight raises an
+        // extra soft warning at <0.5 s.
+        spnDuration_ = dspin(10.0,60000.0,1000.0,0,100.0); spnInterval_ = dspin(sonocontrol::kMinIntervalTimeS,3600.0,5.0,2,0.5); spnSampleRate_ = dspin(0.1,20.0,2.0,1,0.5);
         addRow(gt,0,"Duration",spnDuration_,"ms"); addRow(gt,1,"Interval",spnInterval_,"s"); addRow(gt,2,"Sample Rate",spnSampleRate_,"Hz"); v->addWidget(timing);
         auto* total = new QGroupBox("Experiment Length"); auto* tv = new QVBoxLayout(total);
         rbTotalDur_ = new QRadioButton("Total Duration (mins)");
@@ -1581,7 +2653,19 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         connect(spnTotalDur_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, &SonoControlWindow::updateRepeatingFromDuration);
         connect(spnInterval_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, &SonoControlWindow::updateRepeatingFromDuration);
         connect(spnRepeating_, qOverload<int>(&QSpinBox::valueChanged), this, &SonoControlWindow::updateDurationFromRepeating);
-        grpSafety_ = new QGroupBox("Safety"); auto* sh = new QHBoxLayout(grpSafety_); spnCutoff_ = dspin(35.0,60.0,45.0,1,0.5); sh->addWidget(new QLabel("Cutoff Temp")); sh->addWidget(spnCutoff_); sh->addWidget(new QLabel(QString::fromUtf8("°C"))); v->addWidget(grpSafety_); v->addStretch(); return w;
+        grpSafety_ = new QGroupBox("Safety");
+        auto* safetyV = new QVBoxLayout(grpSafety_);
+        auto* sh = new QHBoxLayout;
+        spnCutoff_ = dspin(35.0, 60.0, 45.0, 1, 0.5);
+        sh->addWidget(new QLabel("Cutoff Temp"));
+        sh->addWidget(spnCutoff_);
+        sh->addWidget(new QLabel(QString::fromUtf8("°C")));
+        sh->addStretch();
+        safetyV->addLayout(sh);
+        chkTempRequired_ = new QCheckBox("Abort run if temperature sensor stops responding (fail-closed)");
+        chkTempRequired_->setToolTip("When enabled, three consecutive invalid temperature samples will stop ultrasound and abort the run. PID and after-target-hold runs always fail closed regardless of this flag.");
+        safetyV->addWidget(chkTempRequired_);
+        v->addWidget(grpSafety_); v->addStretch(); return w;
     }
 
     QWidget* buildPidTab() {
@@ -1612,11 +2696,30 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 
     QWidget* buildCycleTab() {
         auto* w = new QWidget; auto* v = new QVBoxLayout(w); v->setSpacing(12); v->setContentsMargins(12,14,12,14);
-        auto* en = new QGroupBox("Temperature Cycling"); auto* ev = new QVBoxLayout(en); chkCycling_ = new QCheckBox("Enable Heating / Cooling Cycles"); ev->addWidget(chkCycling_); auto* cycleNote = new QLabel("Available only in Total Duration mode. Phase durations are fixed wall-clock durations for long-run stability."); cycleNote->setWordWrap(true); cycleNote->setStyleSheet("color:#667085; font-size:12px;"); ev->addWidget(cycleNote); v->addWidget(en);
-        auto* heat = new QGroupBox("Heating Phase"); auto* hh = new QHBoxLayout(heat); spnHeatS_ = dspin(1.0,86400.0,60.0,0,5.0); hh->addWidget(new QLabel("Duration")); hh->addWidget(spnHeatS_); hh->addWidget(new QLabel("s")); v->addWidget(heat);
-        auto* cool = new QGroupBox("Cooling Phase"); auto* cv = new QVBoxLayout(cool); auto* cr = new QHBoxLayout; spnCoolS_ = dspin(1.0,86400.0,30.0,0,5.0); cr->addWidget(new QLabel("Duration")); cr->addWidget(spnCoolS_); cr->addWidget(new QLabel("s")); cv->addLayout(cr);
+        auto* en = new QGroupBox("Temperature Cycling"); auto* ev = new QVBoxLayout(en); chkCycling_ = new QCheckBox("Enable Heating / Cooling Cycles"); ev->addWidget(chkCycling_); auto* cycleNote = new QLabel("Available only in Total Duration mode. Each phase is capped at the total duration."); cycleNote->setWordWrap(true); cycleNote->setStyleSheet("color:#667085; font-size:12px;"); ev->addWidget(cycleNote); v->addWidget(en);
+        // Phase durations are entered in minutes. The underlying Config struct
+        // still stores seconds (`heating_s`, `cooling_s`) so the experiment
+        // loop and existing .config files keep working unchanged — conversion
+        // happens at buildConfig() / applyConfigToUi().
+        const double initial_total_min = spnTotalDur_ ? spnTotalDur_->value() : 60.0;
+        spnHeatS_ = dspin(0.05, initial_total_min, 1.0, 2, 0.5);
+        spnCoolS_ = dspin(0.05, initial_total_min, 0.5, 2, 0.5);
+        auto* heat = new QGroupBox("Heating Phase"); auto* hh = new QHBoxLayout(heat); hh->addWidget(new QLabel("Duration")); hh->addWidget(spnHeatS_); hh->addWidget(new QLabel("min")); v->addWidget(heat);
+        auto* cool = new QGroupBox("Cooling Phase"); auto* cv = new QVBoxLayout(cool); auto* cr = new QHBoxLayout; cr->addWidget(new QLabel("Duration")); cr->addWidget(spnCoolS_); cr->addWidget(new QLabel("min")); cv->addLayout(cr);
         rbCoolStop_ = new QRadioButton("Stop ultrasound"); rbCoolLow_ = new QRadioButton("Hold at temperature (PID)"); rbCoolStop_->setChecked(true); auto* bg = new QButtonGroup(this); bg->addButton(rbCoolStop_); bg->addButton(rbCoolLow_); cv->addWidget(rbCoolStop_); cv->addWidget(rbCoolLow_);
-        auto* hold = new QGroupBox("Hold Temperature"); auto* hv = new QHBoxLayout(hold); spnCoolHoldTemp_ = dspin(20.0,45.0,37.0,1,0.5); hv->addWidget(new QLabel("Target")); hv->addWidget(spnCoolHoldTemp_); hv->addWidget(new QLabel(QString::fromUtf8("°C"))); cv->addWidget(hold); v->addWidget(cool); v->addStretch(); return w;
+        auto* hold = new QGroupBox("Hold Temperature"); auto* hv = new QHBoxLayout(hold); spnCoolHoldTemp_ = dspin(20.0,45.0,37.0,1,0.5); hv->addWidget(new QLabel("Target")); hv->addWidget(spnCoolHoldTemp_); hv->addWidget(new QLabel(QString::fromUtf8("°C"))); cv->addWidget(hold); v->addWidget(cool); v->addStretch();
+        // Keep the phase caps in sync with total duration as the user edits it.
+        if (spnTotalDur_) {
+            connect(spnTotalDur_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, &SonoControlWindow::updateCyclePhaseCaps);
+        }
+        return w;
+    }
+
+    void updateCyclePhaseCaps() {
+        if (!spnTotalDur_ || !spnHeatS_ || !spnCoolS_) return;
+        const double cap = std::max(spnHeatS_->minimum(), spnTotalDur_->value());
+        spnHeatS_->setMaximum(cap);
+        spnCoolS_->setMaximum(cap);
     }
 
     QWidget* buildConnTab() {
@@ -1639,6 +2742,50 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         tv->addWidget(chkDarkMode_);
         tv->addWidget(chkAutoTheme_);
         v->addWidget(themeGrp);
+
+        // Web server controls. The group is always present; if the build
+        // does not include Qt Network it is permanently disabled with a
+        // single explanatory label so the operator can see *why* the feature
+        // is not available rather than wondering whether it was removed.
+        auto* webGrp = new QGroupBox("Monitoring Web Server");
+        auto* wv = new QVBoxLayout(webGrp);
+#if SONOCONTROL_WEB_SERVER
+        chkWebServer_ = new QCheckBox("Enable web server (session only — never auto-starts on launch)");
+        wv->addWidget(chkWebServer_);
+        auto* webRow1 = new QHBoxLayout;
+        webRow1->addWidget(new QLabel("Port"));
+        spnWebPort_ = ispin(1024, 65535, 50896);
+        spnWebPort_->setMinimumWidth(100);
+        webRow1->addWidget(spnWebPort_);
+        webRow1->addSpacing(16);
+        webRow1->addWidget(new QLabel("Snapshot interval"));
+        spnWebInterval_ = ispin(5, 3600, 900);
+        spnWebInterval_->setSuffix(" s");
+        spnWebInterval_->setMinimumWidth(110);
+        webRow1->addWidget(spnWebInterval_);
+        webRow1->addStretch();
+        wv->addLayout(webRow1);
+        chkWebLan_ = new QCheckBox("Allow LAN access — page is reachable from other devices on this network");
+        chkWebLan_->setToolTip("Off (default): binds 127.0.0.1 — local browser only.\n"
+                               "On: binds all interfaces so the wireless NIC's LAN address serves the page.\n"
+                               "There is no authentication or HTTPS; enable only on trusted networks.");
+        wv->addWidget(chkWebLan_);
+        lblWebStatus_ = new QLabel("Stopped");
+        lblWebStatus_->setStyleSheet("color:#475467; font-size:12px; font-family:Consolas,monospace;");
+        lblWebStatus_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        lblWebStatus_->setWordWrap(true);
+        wv->addWidget(lblWebStatus_);
+        connect(chkWebServer_, &QCheckBox::toggled, this, &SonoControlWindow::onWebServerEnabledToggled);
+        connect(spnWebPort_, qOverload<int>(&QSpinBox::valueChanged), this, [this](int){ onWebServerSettingsChanged(); });
+        connect(spnWebInterval_, qOverload<int>(&QSpinBox::valueChanged), this, [this](int v){ if (webServer_) webServer_->setSnapshotIntervalSeconds(v); });
+        connect(chkWebLan_, &QCheckBox::toggled, this, [this](bool){ onWebServerSettingsChanged(); });
+#else
+        auto* note = new QLabel("This build was compiled without Qt Network — the monitoring web server is unavailable.");
+        note->setWordWrap(true);
+        note->setStyleSheet("color:#98a2b3; font-size:12px;");
+        wv->addWidget(note);
+#endif
+        v->addWidget(webGrp);
 
         v->addStretch(); return w;
     }
@@ -1795,6 +2942,18 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
             QMessageBox::warning(this, "Invalid Timing",
                                  "Interval must be greater than or equal to Duration. The experiment was not started.");
             return false;
+        }
+        // Soft warning when the interval is below the realistic transmit
+        // floor. The validate_config clamp already enforced >= 0.2 s; this
+        // dialog informs the operator so they understand why cycles may be
+        // longer than configured in their CSV.
+        if (cfg.interval_time_s < 0.5) {
+            const auto choice = QMessageBox::warning(this, "Very Short Interval",
+                QString("Interval = %1 s is below the typical transmit time for a single burst "
+                        "(serial CFREQ/PRF/DUR with 100 ms COM gaps + 4096 UDP datagrams).\n\n"
+                        "Cycles will likely be spaced wider than requested. Continue?").arg(cfg.interval_time_s, 0, 'f', 2),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+            if (choice != QMessageBox::Yes) return false;
         }
         if (cfg.cutoff_temp <= cfg.pid_setpoint && (cfg.pid_enabled || cfg.length_mode == sonocontrol::LengthMode::HoldAfterTarget)) {
             QMessageBox::warning(this, "Invalid Safety Limit",
@@ -1994,7 +3153,7 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         QDialog dlg(this);
         dlg.setWindowTitle("Preflight Confirmation");
         dlg.setModal(true);
-        dlg.resize(840, 720);
+        dlg.resize(840, 780);
         auto* layout = new QVBoxLayout(&dlg);
         auto* title = new QLabel("Review settings before starting");
         title->setStyleSheet("font-size:18px; font-weight:700;");
@@ -2005,6 +3164,50 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         summary->setPlainText(configSummary(cfg));
         summary->setStyleSheet("font-family:Consolas,monospace; font-size:12px;");
         layout->addWidget(summary, 1);
+
+        // Session-scoped manual-stop PIN. Independent of any persisted config —
+        // intentionally re-entered for every run so a stale PIN from a previous
+        // operator can't block a hand-off. The PIN gates the manual STOP button
+        // only; the watchdog and force-stop escalation always proceed.
+        auto* lockGrp = new QGroupBox("Manual-stop PIN protection");
+        auto* lockGrid = new QGridLayout(lockGrp);
+        lockGrid->setHorizontalSpacing(14);
+        lockGrid->setVerticalSpacing(10);
+        auto* chkLock = new QCheckBox("Require username + 4-digit PIN to stop this run manually");
+        chkLock->setChecked(pendingPinEnabled_);
+        auto* lblUser = new QLabel("Username");
+        auto* txtUser = new QLineEdit;
+        txtUser->setMaxLength(48);
+        txtUser->setPlaceholderText("e.g. Lab Operator");
+        txtUser->setText(pendingPinUsername_);
+        auto* lblPin = new QLabel("4-digit PIN");
+        auto* pinEntry = new PinEntry(4, /*large=*/false);
+        if (!pendingPin_.isEmpty()) pinEntry->setFromString(pendingPin_);
+        auto* lockErr = new QLabel(" ");
+        lockErr->setStyleSheet("color:#d93025; font-size:12px;");
+        auto* lockNote = new QLabel("If enabled, clicking STOP opens a prompt that shows the username and requires the PIN. The 2-second force-stop escalation and the stall watchdog still bypass the prompt for safety.");
+        lockNote->setWordWrap(true);
+        lockNote->setStyleSheet("color:#667085; font-size:12px;");
+        lockGrid->addWidget(chkLock, 0, 0, 1, 2);
+        lockGrid->addWidget(lblUser, 1, 0);
+        lockGrid->addWidget(txtUser, 1, 1);
+        lockGrid->addWidget(lblPin, 2, 0);
+        lockGrid->addWidget(pinEntry, 2, 1, Qt::AlignLeft);
+        lockGrid->addWidget(lockErr, 3, 0, 1, 2);
+        lockGrid->addWidget(lockNote, 4, 0, 1, 2);
+        layout->addWidget(lockGrp);
+
+        auto setLockEnabled = [&, pinEntry](bool on) {
+            for (auto* w : std::initializer_list<QWidget*>{lblUser, txtUser, lblPin}) {
+                w->setEnabled(on);
+            }
+            pinEntry->setEntryEnabled(on);
+        };
+        setLockEnabled(chkLock->isChecked());
+        connect(chkLock, &QCheckBox::toggled, &dlg, [setLockEnabled](bool on){ setLockEnabled(on); });
+        // Clear any prior error as soon as the operator edits either field.
+        connect(txtUser, &QLineEdit::textEdited, lockErr, [lockErr](const QString&){ lockErr->setText(" "); });
+        connect(pinEntry, &PinEntry::changed, lockErr, [lockErr]{ lockErr->setText(" "); });
 
         auto* confirmRow = new QWidget;
         auto* confirmLayout = new QHBoxLayout(confirmRow);
@@ -2022,10 +3225,35 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         buttons->button(QDialogButtonBox::Ok)->setText("Start Experiment");
         buttons->button(QDialogButtonBox::Ok)->setEnabled(false);
         connect(confirm, &QCheckBox::toggled, buttons->button(QDialogButtonBox::Ok), &QWidget::setEnabled);
-        connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::accepted, &dlg, [&, pinEntry, lockErr]() {
+            if (chkLock->isChecked()) {
+                const QString user = txtUser->text().trimmed();
+                const QString pin = pinEntry->pin();
+                if (user.isEmpty()) {
+                    lockErr->setText("Enter a username (shown on the stop prompt).");
+                    txtUser->setFocus();
+                    return;
+                }
+                static const QRegularExpression kPinPattern("^[0-9]{4}$");
+                if (!kPinPattern.match(pin).hasMatch()) {
+                    lockErr->setText("Enter all 4 digits of the PIN.");
+                    pinEntry->focusFirst();
+                    return;
+                }
+            }
+            dlg.accept();
+        });
         connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
         layout->addWidget(buttons);
-        return dlg.exec() == QDialog::Accepted;
+
+        if (dlg.exec() != QDialog::Accepted) return false;
+
+        // Commit the PIN settings for this run. Cleared in onFinished() so the
+        // next run requires re-entry.
+        pendingPinEnabled_ = chkLock->isChecked();
+        pendingPinUsername_ = pendingPinEnabled_ ? txtUser->text().trimmed() : QString();
+        pendingPin_ = pendingPinEnabled_ ? pinEntry->pin() : QString();
+        return true;
     }
 
     QString autosaveExperimentArtifacts() {
@@ -2124,6 +3352,15 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         if (spnTempMax_) spnTempMax_->setValue(cfg.max_plausible_temp_c);
         if (spnTempRate_) spnTempRate_->setValue(cfg.max_temp_rate_c_per_s);
         if (chkTempFallback_) chkTempFallback_->setChecked(cfg.temp_channel_fallback);
+        if (chkTempRequired_) chkTempRequired_->setChecked(cfg.temperature_required);
+#if SONOCONTROL_WEB_SERVER
+        // Port / interval / LAN flag persist; the enable flag deliberately
+        // does not (see config.hpp). Loading a config will never silently
+        // turn on a LAN-reachable endpoint.
+        if (spnWebPort_) spnWebPort_->setValue(static_cast<int>(cfg.web_server_port));
+        if (spnWebInterval_) spnWebInterval_->setValue(cfg.web_server_snapshot_interval_s);
+        if (chkWebLan_) chkWebLan_->setChecked(cfg.web_server_lan);
+#endif
         if (chkTempMonitor_) chkTempMonitor_->setChecked(cfg.temperature_enabled && !cfg.pid_enabled && cfg.length_mode != sonocontrol::LengthMode::HoldAfterTarget);
         chkPid_->setChecked(cfg.pid_enabled);
         spnSetpoint_->setValue(cfg.pid_setpoint);
@@ -2138,8 +3375,10 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         if (spnHorizon_) spnHorizon_->setValue(cfg.pid_prediction_horizon_s);
         autoSaveDir_ = qstr(cfg.auto_save_dir);
         chkCycling_->setChecked(cfg.use_cycling);
-        spnHeatS_->setValue(cfg.heating_s);
-        spnCoolS_->setValue(cfg.cooling_s);
+        // Config stores phase durations in seconds; spinboxes display minutes.
+        updateCyclePhaseCaps();
+        spnHeatS_->setValue(cfg.heating_s / 60.0);
+        spnCoolS_->setValue(cfg.cooling_s / 60.0);
         if (cfg.cooling_mode == sonocontrol::CoolingMode::Low) rbCoolLow_->setChecked(true); else rbCoolStop_->setChecked(true);
         spnCoolHoldTemp_->setValue(cfg.cooling_hold_temp);
         setComboData(cmbCom3_, qstr(cfg.com3_port));
@@ -2251,8 +3490,22 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         c.sampling_rate_hz = spnSampleRate_->value(); c.cutoff_temp = spnCutoff_->value(); c.min_plausible_temp_c = spnTempMin_ ? spnTempMin_->value() : 10.0; c.max_plausible_temp_c = spnTempMax_ ? spnTempMax_->value() : 80.0; c.max_temp_rate_c_per_s = spnTempRate_ ? spnTempRate_->value() : 15.0;
         c.pid_enabled = chkPid_->isChecked();
         c.temperature_enabled = c.pid_enabled || (c.length_mode == sonocontrol::LengthMode::HoldAfterTarget) || (chkTempMonitor_ && chkTempMonitor_->isChecked());
+        c.temperature_required = chkTempRequired_ && chkTempRequired_->isChecked();
+#if SONOCONTROL_WEB_SERVER
+        // Web server: do NOT propagate the live enable flag into Config.
+        // Persisting it could let a shared .config auto-start a LAN-reachable
+        // server on launch elsewhere. Port / interval / LAN flag are fine.
+        if (spnWebPort_) c.web_server_port = static_cast<uint16_t>(spnWebPort_->value());
+        if (spnWebInterval_) c.web_server_snapshot_interval_s = spnWebInterval_->value();
+        if (chkWebLan_) c.web_server_lan = chkWebLan_->isChecked();
+        c.web_server_enabled = false;  // session-only
+#endif
         c.pid_setpoint = spnSetpoint_->value(); c.pid_amplitude = chkPidAmp_->isChecked(); c.pid_duration = chkPidDuration_->isChecked(); c.pid_duty = chkPidDuty_->isChecked(); c.pid_interval = chkPidInterval_->isChecked(); c.pid_kp = spnKp_->value(); c.pid_ki = spnKi_->value(); c.pid_kd = spnKd_->value(); c.pid_prediction_tau_s = spnTau_ ? spnTau_->value() : 25.0; c.pid_prediction_horizon_s = spnHorizon_ ? spnHorizon_->value() : 0.0; c.auto_save_dir = autoSaveDir_.toStdString();
-        c.use_cycling = chkCycling_->isChecked(); c.heating_s = spnHeatS_->value(); c.cooling_s = spnCoolS_->value(); c.cooling_mode = rbCoolStop_->isChecked() ? sonocontrol::CoolingMode::Stop : sonocontrol::CoolingMode::Low; c.cooling_hold_temp = spnCoolHoldTemp_->value();
+        c.use_cycling = chkCycling_->isChecked();
+        // Spinboxes are in minutes; Config carries seconds (interface unchanged).
+        c.heating_s = spnHeatS_->value() * 60.0;
+        c.cooling_s = spnCoolS_->value() * 60.0;
+        c.cooling_mode = rbCoolStop_->isChecked() ? sonocontrol::CoolingMode::Stop : sonocontrol::CoolingMode::Low; c.cooling_hold_temp = spnCoolHoldTemp_->value();
         c.com3_port = cmbCom3_->currentData().toString().toStdString(); c.com11_port = cmbCom11_->currentData().toString().toStdString(); c.temp_channel = static_cast<sonocontrol::TempChannel>(cmbTempChannel_->currentIndex()); c.temp_channel_fallback = chkTempFallback_ && chkTempFallback_->isChecked(); c.udp_host = txtUdpHost_->text().trimmed().toStdString(); c.udp_port = static_cast<uint16_t>(spnUdpPort_->value());
         c.simulate_temp = c.temperature_enabled && debugSimChecked(chkSimTemp_); c.simulate_us = debugSimChecked(chkSimUs_);
         return c;
@@ -2390,6 +3643,312 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
     void touchWorkerSignal() {
         lastWorkerSignalMs_ = QDateTime::currentMSecsSinceEpoch();
         workerStallNotified_ = false;
+#if SONOCONTROL_WEB_SERVER
+        // Backfill the canonical session id the moment the worker reports
+        // its first signal — by that point logger.start_session has run on
+        // the worker thread and session_id() is non-empty. The web server's
+        // updateSessionId is a no-op if the value hasn't changed, so calling
+        // this on every signal is microseconds.
+        if (webServer_ && running_) {
+            const QString id = QString::fromStdString(logger_.session_id());
+            if (!id.isEmpty()) webServer_->updateSessionId(id);
+        }
+#endif
+    }
+
+    // ── Sequence runner ────────────────────────────────────────────────────
+    void openSequenceDialog() {
+        // The dialog is non-modal and reusable across opens. Closing the
+        // dialog while a sequence is running does not stop the sequence — the
+        // controller state lives on this window. When the dialog is reopened
+        // it re-binds to that live state.
+        if (!sequenceDialog_) {
+            sequenceDialog_ = new SequenceDialog(this);
+            connect(sequenceDialog_, &SequenceDialog::startRequested, this, &SonoControlWindow::onSequenceStartRequested);
+            connect(sequenceDialog_, &SequenceDialog::stopRequested, this, &SonoControlWindow::onSequenceStopRequested);
+        }
+        sequenceDialog_->seedState(savedSequenceItems_, savedSequenceIntervalsMin_);
+        sequenceDialog_->setRunningState(sequenceActive_);
+        if (sequenceActive_) {
+            sequenceDialog_->setCurrentIndex(sequenceIndex_);
+            sequenceDialog_->setStatusText(QString("Sequence running: item %1 of %2.")
+                                              .arg(sequenceIndex_ + 1).arg(sequenceTotal_));
+        }
+        sequenceDialog_->show();
+        sequenceDialog_->raise();
+        sequenceDialog_->activateWindow();
+    }
+
+    void onSequenceStartRequested() {
+        if (!sequenceDialog_) return;
+        if (sequenceActive_ || running_) return;
+        const auto items = sequenceDialog_->items();
+        if (items.isEmpty()) return;
+        savedSequenceItems_ = items;
+        savedSequenceIntervalsMin_ = sequenceDialog_->intervalsMinutes();
+        // Defensive normalization — should already match because seedState/
+        // rebuild keep them in sync, but a sequence with N items must have
+        // exactly N-1 interval entries before we start consuming them.
+        const int wanted = std::max(0, static_cast<int>(items.size()) - 1);
+        while (savedSequenceIntervalsMin_.size() < wanted) savedSequenceIntervalsMin_.append(5);
+        while (savedSequenceIntervalsMin_.size() > wanted) savedSequenceIntervalsMin_.removeLast();
+        sequencePinEnabled_ = sequenceDialog_->pinEnabled();
+        sequencePinUsername_ = sequencePinEnabled_ ? sequenceDialog_->pinUsername() : QString();
+        sequencePin_ = sequencePinEnabled_ ? sequenceDialog_->pinValue() : QString();
+        sequenceStopOnError_ = sequenceDialog_->stopOnError();
+        sequenceActive_ = true;
+        sequenceStopRequested_ = false;
+        sequenceIndex_ = 0;
+        sequenceTotal_ = static_cast<int>(items.size());
+        // Lock the main page buttons for the entire sequence; the sequence
+        // dialog provides its own start/stop.
+        btnStart_->setEnabled(false);
+        btnStop_->setEnabled(false);
+        QString gapStr;
+        if (savedSequenceIntervalsMin_.isEmpty()) {
+            gapStr = "no gaps";
+        } else {
+            QStringList parts;
+            for (int v : savedSequenceIntervalsMin_) parts << QString::number(v);
+            gapStr = "intervals " + parts.join("/") + " min";
+        }
+        appendConsole(QString("=== Sequence started: %1 configuration(s), %2 ===")
+                          .arg(sequenceTotal_).arg(gapStr));
+        statusBar()->showMessage("Sequence running");
+        if (sequenceDialog_) {
+            sequenceDialog_->setRunningState(true);
+            sequenceDialog_->setCurrentIndex(0);
+            sequenceDialog_->setStatusText("Starting first configuration…");
+        }
+        launchCurrentSequenceItem();
+    }
+
+    void onSequenceStopRequested() {
+        if (!sequenceActive_) return;
+        if (sequencePinEnabled_ && !promptForSequenceStopPin()) {
+            appendConsole(">>> Sequence stop cancelled (PIN not confirmed)");
+            statusBar()->showMessage("Sequence stop cancelled");
+            return;
+        }
+        sequenceStopRequested_ = true;
+        sequenceIntervalTimer_.stop();
+        appendConsole(">>> Sequence STOP requested");
+        statusBar()->showMessage("Stopping sequence");
+        if (sequenceDialog_) sequenceDialog_->setStatusText("Stopping sequence…");
+        if (worker_) {
+            worker_->stop();
+            // Escalate to force-stop after 2 s of unresponsive worker,
+            // mirroring the main onStop() path. The watchdog escalation is
+            // also active and provides an independent safety net.
+            QTimer::singleShot(2000, this, [this]() {
+                if (running_ && worker_) {
+                    appendConsole(">>> Sequence stop escalating to force-stop (cancelling pending I/O)");
+                    worker_->forceStop();
+                }
+            });
+        } else {
+            // No worker currently running (we're in the inter-config gap) —
+            // finalize the sequence right away.
+            finalizeSequence(/*ok=*/false);
+        }
+    }
+
+    void launchCurrentSequenceItem() {
+        if (!sequenceActive_) return;
+        if (sequenceIndex_ < 0 || sequenceIndex_ >= savedSequenceItems_.size()) {
+            finalizeSequence(/*ok=*/true);
+            return;
+        }
+        sonocontrol::Config cfg = savedSequenceItems_[sequenceIndex_].cfg;
+        cfg.config_source_type = "sequence";
+        cfg.config_file_path = savedSequenceItems_[sequenceIndex_].path.toStdString();
+        validate_config(cfg);
+        if (sequenceDialog_) {
+            sequenceDialog_->setCurrentIndex(sequenceIndex_);
+            sequenceDialog_->setStatusText(QString("Running %1 of %2: %3")
+                                              .arg(sequenceIndex_ + 1).arg(sequenceTotal_)
+                                              .arg(QFileInfo(savedSequenceItems_[sequenceIndex_].path).fileName()));
+        }
+        launchWorkerForConfig(cfg, /*fromSequence=*/true);
+    }
+
+    void handleSequenceItemFinished(int code) {
+        if (!sequenceActive_) return;
+        if (sequenceStopRequested_) { finalizeSequence(/*ok=*/false); return; }
+        // Exit codes from ExperimentRunner: 0=clean, 1=error, 2=cutoff,
+        // 3=manual stop. Any non-zero code is a "failed" config — abort the
+        // queue if the operator selected stop-on-error.
+        if (sequenceStopOnError_ && code != 0) {
+            appendConsole(QString("=== [Sequence] Aborting: configuration %1 ended with code %2 and 'stop on error' is enabled ===")
+                              .arg(sequenceIndex_ + 1).arg(code));
+            if (sequenceDialog_) sequenceDialog_->setStatusText("Sequence aborted on configuration failure.");
+            finalizeSequence(/*ok=*/false);
+            return;
+        }
+        const bool wasLast = (sequenceIndex_ + 1 >= sequenceTotal_);
+        if (wasLast) { finalizeSequence(/*ok=*/true); return; }
+        // Schedule the next item after the per-gap interval (in minutes).
+        // savedSequenceIntervalsMin_[k] is the interval that runs AFTER
+        // items[k] finishes and BEFORE items[k+1] starts, so we index by the
+        // index of the experiment that just finished. The 0-minute case still
+        // goes through the timer for one event-loop tick so the GUI repaints
+        // cleanly between configs.
+        const int gapMin = (sequenceIndex_ >= 0 && sequenceIndex_ < savedSequenceIntervalsMin_.size())
+                               ? savedSequenceIntervalsMin_[sequenceIndex_]
+                               : 0;
+        const qint64 delayMs = static_cast<qint64>(std::max(0, gapMin)) * 60 * 1000;
+        if (sequenceDialog_) {
+            sequenceDialog_->setStatusText(QString("Waiting %1 min before configuration %2 of %3…")
+                                               .arg(gapMin).arg(sequenceIndex_ + 2).arg(sequenceTotal_));
+        }
+        appendConsole(QString("=== [Sequence] Waiting %1 min before next configuration ===").arg(gapMin));
+        sequenceIntervalTimer_.stop();
+        sequenceIntervalTimer_.setSingleShot(true);
+        sequenceIntervalTimer_.setInterval(static_cast<int>(std::min<qint64>(delayMs, std::numeric_limits<int>::max())));
+        sequenceIntervalTimer_.start();
+    }
+
+    void onSequenceIntervalElapsed() {
+        if (!sequenceActive_ || sequenceStopRequested_) return;
+        ++sequenceIndex_;
+        launchCurrentSequenceItem();
+    }
+
+#if SONOCONTROL_WEB_SERVER
+    // Lazy construction so users who never enable monitoring don't pay the
+    // QTcpServer / QTimer cost. Reuses the same instance across toggles.
+    sonocontrol::WebServer* ensureWebServer() {
+        if (webServer_) return webServer_;
+        webServer_ = new sonocontrol::WebServer(this);
+        connect(webServer_, &sonocontrol::WebServer::statusChanged,
+                this, &SonoControlWindow::refreshWebServerStatus);
+        return webServer_;
+    }
+
+    void onWebServerEnabledToggled(bool enabled) {
+        if (enabled) {
+            auto* ws = ensureWebServer();
+            ws->setPort(static_cast<uint16_t>(spnWebPort_->value()));
+            ws->setSnapshotIntervalSeconds(spnWebInterval_->value());
+            ws->setAllowLan(chkWebLan_->isChecked());
+            if (!ws->start()) {
+                QMessageBox::warning(this, "Web Server",
+                    "Could not start the monitoring web server:\n\n" + ws->bindError() +
+                    "\n\nThe port may already be in use, or the requested address may not be bindable.");
+                QSignalBlocker b(chkWebServer_);
+                chkWebServer_->setChecked(false);
+                return;
+            }
+            appendConsole(QString("Web server started: %1").arg(ws->listenUrls().join(", ")));
+        } else if (webServer_) {
+            webServer_->stop();
+            appendConsole("Web server stopped");
+        }
+        refreshWebServerStatus();
+    }
+
+    void onWebServerSettingsChanged() {
+        // Port or LAN flag changed. If the server is running, rebind on the
+        // new values. If it isn't, just remember the new values for the next
+        // start.
+        if (!webServer_ || !webServer_->isRunning()) return;
+        webServer_->setPort(static_cast<uint16_t>(spnWebPort_->value()));
+        webServer_->setAllowLan(chkWebLan_->isChecked());
+        if (!webServer_->start()) {
+            QMessageBox::warning(this, "Web Server",
+                "Could not rebind the monitoring web server:\n\n" + webServer_->bindError());
+            QSignalBlocker b(chkWebServer_);
+            chkWebServer_->setChecked(false);
+        }
+        refreshWebServerStatus();
+    }
+
+    void refreshWebServerStatus() {
+        if (!lblWebStatus_) return;
+        if (!webServer_ || !webServer_->isRunning()) {
+            lblWebStatus_->setText("Stopped");
+            return;
+        }
+        QStringList urls = webServer_->listenUrls();
+        lblWebStatus_->setText("Listening on:  " + urls.join("    "));
+    }
+#endif
+
+    void finalizeSequence(bool ok) {
+        const bool wasActive = sequenceActive_;
+        sequenceActive_ = false;
+        sequenceIntervalTimer_.stop();
+        if (!wasActive) return;
+        if (ok) {
+            appendConsole("=== Sequence finished ===");
+            statusBar()->showMessage("Sequence finished");
+        } else {
+            appendConsole("=== Sequence stopped ===");
+            statusBar()->showMessage("Sequence stopped");
+        }
+        // Restore main-page buttons.
+        btnStart_->setEnabled(true);
+        btnStop_->setEnabled(false);
+        if (sequenceDialog_) sequenceDialog_->setSequenceFinished(ok);
+        // Drop the sequence PIN so a future sequence forces re-entry.
+        sequencePinEnabled_ = false;
+        sequencePinUsername_.clear();
+        sequencePin_.clear();
+        sequenceStopOnError_ = false;
+        sequenceIndex_ = -1;
+        sequenceTotal_ = 0;
+        sequenceStopRequested_ = false;
+    }
+
+    // Sequence-specific PIN prompt. Identical UX to promptForStopPin() but
+    // reads from the sequence credentials so a sequence can have its own
+    // operator/PIN distinct from a per-run PIN entered on a previous (non-
+    // sequence) run.
+    bool promptForSequenceStopPin() {
+        QDialog dlg(this);
+        dlg.setWindowTitle("Confirm Sequence Stop");
+        dlg.setModal(true);
+        dlg.setMinimumWidth(440);
+        auto* v = new QVBoxLayout(&dlg);
+        v->setContentsMargins(36, 28, 36, 22);
+        v->setSpacing(14);
+        auto* title = new QLabel("Stop sequence?");
+        title->setAlignment(Qt::AlignCenter);
+        title->setStyleSheet("font-size:22px; font-weight:700;");
+        v->addWidget(title);
+        auto* who = new QLabel(QString("Current user: <b>%1</b>").arg(sequencePinUsername_.toHtmlEscaped()));
+        who->setTextFormat(Qt::RichText);
+        who->setAlignment(Qt::AlignCenter);
+        who->setStyleSheet("font-size:14px; color:#344054;");
+        v->addWidget(who);
+        auto* prompt = new QLabel("Enter the 4-digit PIN to stop the sequence");
+        prompt->setAlignment(Qt::AlignCenter);
+        prompt->setStyleSheet("font-size:13px; color:#475467;");
+        v->addWidget(prompt);
+        v->addSpacing(4);
+        auto* pinEntry = new PinEntry(4, /*large=*/true);
+        v->addWidget(pinEntry, 0, Qt::AlignCenter);
+        auto* err = new QLabel(" ");
+        err->setAlignment(Qt::AlignCenter);
+        err->setStyleSheet("color:#d93025; font-size:12px; min-height:18px;");
+        v->addWidget(err);
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+        auto* okBtn = buttons->button(QDialogButtonBox::Ok);
+        okBtn->setText("Stop");
+        okBtn->setEnabled(false);
+        v->addWidget(buttons);
+        connect(pinEntry, &PinEntry::changed, okBtn, [pinEntry, okBtn, err]() {
+            okBtn->setEnabled(pinEntry->pin().size() == 4);
+            err->setText(" ");
+        });
+        connect(pinEntry, &PinEntry::completed, okBtn, [okBtn]() { if (okBtn->isEnabled()) okBtn->animateClick(); });
+        connect(buttons, &QDialogButtonBox::accepted, &dlg, [&, pinEntry, err]() {
+            if (pinEntry->pin() != sequencePin_) { err->setText("Incorrect PIN."); pinEntry->clearPin(); return; }
+            dlg.accept();
+        });
+        connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        pinEntry->focusFirst();
+        return dlg.exec() == QDialog::Accepted;
     }
 
     void stopWorker(bool blocking) {
@@ -2472,8 +4031,52 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
     // one more iteration after we've started tearing down its thread.
     bool shutdownInProgress_ = false;
 
+    // Manual-stop PIN state. Captured from the Preflight Confirmation dialog
+    // for the current run only; cleared in onFinished() so the next run forces
+    // re-entry. Watchdog/force-stop escalation paths ignore these.
+    bool pendingPinEnabled_ = false;
+    QString pendingPinUsername_;
+    QString pendingPin_;
+
+    // Experiment sequence state. The dialog itself is created lazily when the
+    // user opens Edit→Sequence; savedSequenceItems_ + savedSequenceIntervalsMin_
+    // persist across opens so the queue and per-gap intervals survive closing
+    // the dialog. sequenceActive_ stays true for the entire sequence and gates
+    // the main page Start/Stop buttons.
+    //
+    // Invariant: savedSequenceIntervalsMin_.size() == max(0, savedSequenceItems_.size() - 1)
+    // when sequenceActive_ is true. The interval at index k runs AFTER
+    // items[k] finishes and BEFORE items[k+1] starts.
+    SequenceDialog* sequenceDialog_ = nullptr;
+    QList<SequenceItem> savedSequenceItems_;
+    QList<int> savedSequenceIntervalsMin_;
+    bool sequenceActive_ = false;
+    bool sequenceStopRequested_ = false;
+    int sequenceIndex_ = -1;
+    int sequenceTotal_ = 0;
+    QTimer sequenceIntervalTimer_;
+    bool sequencePinEnabled_ = false;
+    QString sequencePinUsername_;
+    QString sequencePin_;
+    bool sequenceStopOnError_ = false;
+
+#if SONOCONTROL_WEB_SERVER
+    // Web server lives on the GUI thread. SonoControlWindow forwards
+    // worker-thread signals (already arriving via QueuedConnection by
+    // default) to it via plain function calls — no DirectConnection, no
+    // cross-thread mutation. The pointer is null until enable is toggled
+    // (lazy construction), so the GUI startup cost is unchanged for users
+    // who never enable monitoring.
+    sonocontrol::WebServer* webServer_ = nullptr;
+    QCheckBox* chkWebServer_ = nullptr;
+    QSpinBox* spnWebPort_ = nullptr;
+    QSpinBox* spnWebInterval_ = nullptr;
+    QCheckBox* chkWebLan_ = nullptr;
+    QLabel* lblWebStatus_ = nullptr;
+#endif
+
     QPushButton *btnStart_{}, *btnStop_{}, *btnTestTemp_{};
-    QCheckBox *chkSimTemp_{}, *chkSimUs_{}, *chkPid_{}, *chkTempMonitor_{}, *chkTempFallback_{}, *chkPidAmp_{}, *chkPidDuration_{}, *chkPidInterval_{}, *chkPidDuty_{}, *chkCycling_{}, *chkConsole_{};
+    QCheckBox *chkSimTemp_{}, *chkSimUs_{}, *chkPid_{}, *chkTempMonitor_{}, *chkTempFallback_{}, *chkTempRequired_{}, *chkPidAmp_{}, *chkPidDuration_{}, *chkPidInterval_{}, *chkPidDuty_{}, *chkCycling_{}, *chkConsole_{};
     QLabel *lblCom3Status_{}, *lblUsStatus_{}, *lblTempStatus_{}, *lblPortInfo_{}, *lblTempRequirement_{}, *lblConfigStatus_{};
     QDoubleSpinBox *spnAmp_{}, *spnCfreq_{}, *spnPrf_{}, *spnDuty_{}, *spnDuration_{}, *spnInterval_{}, *spnSampleRate_{}, *spnTotalDur_{}, *spnTargetHoldMin_{}, *spnTargetTol_{}, *spnCutoff_{}, *spnSetpoint_{}, *spnKp_{}, *spnKi_{}, *spnKd_{}, *spnTau_{}, *spnHorizon_{}, *spnHeatS_{}, *spnCoolS_{}, *spnCoolHoldTemp_{}, *spnTempMin_{}, *spnTempMax_{}, *spnTempRate_{};
     QSpinBox *spnRepeating_{}, *spnUdpPort_{};
@@ -2498,7 +4101,7 @@ int main(int argc, char** argv) {
     QApplication app(argc, argv);
     QApplication::setStyle("Fusion");
     app.setApplicationName("SonoControl");
-    app.setApplicationVersion("1.6.0-fixed-tau-config-menu");
+    app.setApplicationVersion("1.9.1");
     SonoControlWindow w;
     w.show();
     return app.exec();
