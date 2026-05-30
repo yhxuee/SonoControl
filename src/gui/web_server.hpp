@@ -56,7 +56,7 @@ public:
     // this object). Each transition triggers an immediate snapshot rebuild
     // so the page reflects state changes without waiting for the next tick.
     void onRunStarted(const QString& sessionId);
-    void onRunFinished(int exitCode);  // 0=clean, 1=error, 2=cutoff, 3=manual
+    void onRunFinished(int exitCode);  // 0=clean, 1=error, 2=cutoff, 3=manual, 4=watchdog comms-stall
     void onSampleAvailable(double time_s, double t1, double t2, double avg);
     void onTimesUpdated(double elapsed_s, double remaining_s);
     // Replace the session id once the logger publishes the real one (the

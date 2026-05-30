@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -15,6 +16,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace sonocontrol {
@@ -96,6 +98,17 @@ void ExperimentRunner::force_stop() {
     try { udp_sender_.cancel_io(); } catch (...) {}
 }
 
+void ExperimentRunner::watchdog_stop() {
+    // Identical unblock-and-stop mechanism to force_stop(), but latches a
+    // watchdog stop rather than a manual one. Deliberately does NOT touch
+    // manual_stop_latched_: a stall the watchdog had to break is reported as an
+    // automatic comms-stall stop (code 4), not as an operator stop (code 3).
+    watchdog_stop_latched_ = true;
+    stop_flag_ = true;
+    try { ultrasound_serial_.cancel_io(); } catch (...) {}
+    try { udp_sender_.cancel_io(); } catch (...) {}
+}
+
 ActiveParams ExperimentRunner::initial_params_from_config(const Config& c) {
     return ActiveParams{c.amplitude, c.cfreq_hz, c.prf_hz, c.duty_cycle,
                         c.duration_ms, c.interval_time_s, c.wave_shape};
@@ -104,6 +117,7 @@ ActiveParams ExperimentRunner::initial_params_from_config(const Config& c) {
 int ExperimentRunner::run() {
     stop_flag_ = false;
     manual_stop_latched_ = false;
+    watchdog_stop_latched_ = false;
     PIDController pid(config_.pid_kp, config_.pid_ki, config_.pid_kd);
 
     const ActiveParams initial_params = initial_params_from_config(config_);
@@ -141,8 +155,8 @@ int ExperimentRunner::run() {
 
     bool predictor_initialized = false;
     double filtered_control_temp = 0.0;
-    double previous_filtered_control_temp = 0.0;
-    auto previous_temp_sample_time = experiment_start;
+    // (t_rel_s, raw_temp) sliding window for the 30 s least-squares dT/dt fit.
+    std::deque<std::pair<double, double>> rate_window;
 
     logger_.start_session(initial_params, config_);
     // Seed the per-sample state columns. Phase tracks the experiment state
@@ -266,23 +280,53 @@ int ExperimentRunner::run() {
 
                 double control_temp_filtered = avg;
                 double control_rate_c_per_s = 0.0;
+                const double t_rel = std::chrono::duration<double>(now - experiment_start).count();
                 if (!predictor_initialized) {
                     filtered_control_temp = avg;
-                    previous_filtered_control_temp = avg;
-                    previous_temp_sample_time = now;
                     predictor_initialized = true;
                 } else {
-                    const double dt_predict = std::max(0.001, std::chrono::duration<double>(now - previous_temp_sample_time).count());
-                    previous_temp_sample_time = now;
-                    previous_filtered_control_temp = filtered_control_temp;
-                    // α=0.25 single-pole IIR: smooths 2 Hz samples without
-                    // introducing more than ~2 sample lag at typical heating rates.
+                    // α=0.25 single-pole IIR smooths the temperature *level*
+                    // (2 Hz samples, <~2 sample lag). The slope is estimated
+                    // separately below so the two concerns stay decoupled.
                     constexpr double alpha = 0.25;
                     filtered_control_temp = filtered_control_temp + alpha * (avg - filtered_control_temp);
-                    control_rate_c_per_s = (filtered_control_temp - previous_filtered_control_temp) / dt_predict;
-                    control_rate_c_per_s = std::clamp(control_rate_c_per_s, -0.20, 0.20);
                 }
                 control_temp_filtered = filtered_control_temp;
+
+                // dT/dt for the predictive model. A single-sample finite
+                // difference at 2 Hz is dominated by probe quantisation: ±0.1 °C
+                // of jitter over 0.5 s reads as ±0.2 °C/s — the entire clamp
+                // range — so the old rate was essentially noise. Instead fit a
+                // least-squares line over a 30 s sliding window and take its
+                // slope. The regression averages out per-sample noise while
+                // still tracking real trends, and it runs on the *raw* channel
+                // average (not the EWMA) so the slope carries no filter lag —
+                // the fit itself is the smoother.
+                constexpr double kRateWindowSeconds = 30.0;
+                rate_window.emplace_back(t_rel, avg);
+                while (rate_window.size() > 2 &&
+                       t_rel - rate_window.front().first > kRateWindowSeconds) {
+                    rate_window.pop_front();
+                }
+                const double window_span = rate_window.back().first - rate_window.front().first;
+                // Need enough lever arm in t before the slope is trustworthy;
+                // until ~5 s of data has accumulated, leave the rate at 0
+                // (prediction effectively off) rather than amplify start-up noise.
+                if (rate_window.size() >= 3 && window_span >= 5.0) {
+                    double sum_t = 0.0, sum_y = 0.0;
+                    for (const auto& [t, y] : rate_window) { sum_t += t; sum_y += y; }
+                    const double n = static_cast<double>(rate_window.size());
+                    const double mean_t = sum_t / n, mean_y = sum_y / n;
+                    double sxx = 0.0, sxy = 0.0;
+                    for (const auto& [t, y] : rate_window) {
+                        const double dt_t = t - mean_t;
+                        sxx += dt_t * dt_t;
+                        sxy += dt_t * (y - mean_y);
+                    }
+                    if (sxx > 1e-9) {
+                        control_rate_c_per_s = std::clamp(sxy / sxx, -0.20, 0.20);
+                    }
+                }
 
 
                 const double prediction_tau_s = std::max(0.0, config_.pid_prediction_tau_s);
@@ -487,6 +531,18 @@ int ExperimentRunner::run() {
         close_ultrasound_serial();
         if (callbacks_.done) callbacks_.done(3);
         return 3;
+    }
+    if (watchdog_stop_latched_.load()) {
+        // The stall watchdog had to cancel a wedged serial/UDP transfer. This
+        // is an automatic recovery, not an operator action — report it as such
+        // so the GUI does not raise a misleading "stopped manually" dialog.
+        log_console("Experiment stopped automatically by the stall watchdog "
+                    "(device stopped responding). Emergency STOP sent.");
+        logger_.log_event("Watchdog auto-stop (communication stall)");
+        logger_.end_session();
+        close_ultrasound_serial();
+        if (callbacks_.done) callbacks_.done(4);
+        return 4;
     }
     log_console("Experiment complete. STOP sent.");
     logger_.log_event("Experiment complete");

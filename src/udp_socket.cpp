@@ -18,6 +18,15 @@
 
 namespace sonocontrol {
 
+namespace {
+// Send-side socket tuning, shared by both platform branches of open().
+// kSendBufferBytes is generously sized to hold a full 4096-datagram waveform
+// burst; kSendTimeoutMs caps a blocking sendto() so a rare buffer overflow
+// fails fast (≈3 sends × 1 s + backoff < the 5 s watchdog) instead of hanging.
+constexpr int kSendBufferBytes = 1 << 20;  // 1 MiB
+constexpr unsigned kSendTimeoutMs = 1000;
+}
+
 #ifdef _WIN32
 namespace {
 struct WsaInit {
@@ -45,6 +54,18 @@ bool UdpSender::open(uint16_t source_port) {
     if (socket_ == INVALID_SOCKET) return false;
     BOOL reuse = TRUE;
     setsockopt(static_cast<SOCKET>(socket_), SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+    // Bound how long a single sendto() can block, and enlarge the send buffer.
+    // A waveform burst fires 4096 datagrams back-to-back; if the device/NIC is
+    // briefly slow to drain, the default-sized buffer fills and a blocking
+    // sendto() wedges the worker thread indefinitely. That stall used to trip
+    // the GUI watchdog and abort the run. The larger buffer absorbs a full
+    // burst, and the timeout caps the rare overflow so the send fails fast and
+    // transmit()'s retry/backoff handles it (raising a clear error if it
+    // persists) instead of hanging.
+    DWORD send_timeout_ms = kSendTimeoutMs;
+    setsockopt(static_cast<SOCKET>(socket_), SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&send_timeout_ms), sizeof(send_timeout_ms));
+    int sndbuf = kSendBufferBytes;
+    setsockopt(static_cast<SOCKET>(socket_), SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -58,6 +79,14 @@ bool UdpSender::open(uint16_t source_port) {
     if (socket_ < 0) return false;
     int reuse = 1;
     setsockopt(socket_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    // See the Windows branch above: bound a blocking sendto() and enlarge the
+    // send buffer so a 4096-datagram burst cannot wedge the worker thread.
+    timeval send_timeout{};
+    send_timeout.tv_sec = kSendTimeoutMs / 1000;
+    send_timeout.tv_usec = (kSendTimeoutMs % 1000) * 1000;
+    setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
+    int sndbuf = kSendBufferBytes;
+    setsockopt(socket_, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);

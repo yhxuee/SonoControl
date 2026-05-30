@@ -44,10 +44,16 @@ public:
 
     void request_stop();
     void emergency_stop_noexcept();
-    // Aggressive stop: sets the stop flag AND cancels any pending serial/UDP
-    // I/O on the worker thread so a wedged WriteFile/sendto returns immediately.
-    // Safe to call from any thread, including from a GUI watchdog timer.
+    // Aggressive *operator-initiated* stop: sets the stop flag AND cancels any
+    // pending serial/UDP I/O so a wedged WriteFile/sendto returns immediately.
+    // Latches manual intent → run() reports code 3 (manual). Used by the
+    // EMERGENCY STOP button and its 2 s graceful→force escalation.
     void force_stop();
+    // Same I/O-cancelling mechanism, but latches a *watchdog* stop instead of a
+    // manual one so run() reports code 4 (automatic comms-stall stop). Called by
+    // the GUI stall watchdog when the worker wedges in a blocking send/write —
+    // keeps an automatic recovery from being mis-reported as an operator stop.
+    void watchdog_stop();
     int run();
 
 private:
@@ -102,6 +108,11 @@ private:
     // send_stop() still reports return code 3 (manual) instead of being
     // overwritten back to 0 (complete). See the comment in send_stop().
     std::atomic<bool> manual_stop_latched_{false};
+    // Latched watchdog-stop flag, set only by watchdog_stop(). Distinct from
+    // manual_stop_latched_ so the end-of-run logic can report an automatic
+    // comms-stall recovery (code 4) separately from an operator stop (code 3).
+    // Manual intent takes precedence if both are somehow latched.
+    std::atomic<bool> watchdog_stop_latched_{false};
 };
 
 } // namespace sonocontrol

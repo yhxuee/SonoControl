@@ -560,9 +560,16 @@ public slots:
 
     // Aggressive variant: also cancels any pending serial/UDP I/O so a wedged
     // worker thread unblocks immediately. Called by the EMERGENCY STOP button
-    // (after a graceful stop request) and by the stall watchdog.
+    // after a graceful stop request. Latches an operator (manual) stop.
     void forceStop() {
         if (auto* r = runnerRaw_.load(std::memory_order_acquire)) r->force_stop();
+    }
+
+    // Watchdog variant: same I/O cancellation, but latches an automatic
+    // comms-stall stop (code 4) instead of a manual one. Called only by the
+    // stall watchdog so its recovery is not mis-reported as an operator stop.
+    void watchdogStop() {
+        if (auto* r = runnerRaw_.load(std::memory_order_acquire)) r->watchdog_stop();
     }
 
 signals:
@@ -1226,6 +1233,15 @@ void SequenceDialog::setRunningState(bool active) {
     if (chkStopOnError_) chkStopOnError_->setEnabled(!active);
     btnStart_->setEnabled(!active && !items_.isEmpty());
     btnStop_->setEnabled(active);
+    if (active) {
+        // Hide the PIN digits the moment the sequence locks in. The value
+        // has already been captured into SonoControlWindow::sequencePin_ by
+        // onSequenceStartRequested *before* this call, so clearing the
+        // visible boxes is purely cosmetic — but it stops the PIN from
+        // sitting on screen for the duration of an hours-long sequence (or
+        // staying visible when the dialog is reopened after a finished run).
+        pinEntry_->clearPin();
+    }
     rebuild();
 }
 
@@ -1622,11 +1638,11 @@ private slots:
         // resuming it here keeps the pills accurate during the inter-config
         // interval.
         if (probe_ && !shutdownInProgress_) probe_->setPaused(false);
-        lblCycle_->setText(code == 0 ? "COMPLETE" : (code == 2 ? "CUTOFF" : (code == 3 ? "STOPPED" : "ERROR")));
-        lblCycle_->setStyleSheet(valueStyle(code == 0 ? "#00897b" : (code == 3 ? "#b54708" : (code == 2 ? "#d93025" : "#b42318"))));
+        lblCycle_->setText(code == 0 ? "COMPLETE" : (code == 2 ? "CUTOFF" : (code == 3 ? "STOPPED" : (code == 4 ? "STALLED" : "ERROR"))));
+        lblCycle_->setStyleSheet(valueStyle(code == 0 ? "#00897b" : ((code == 3 || code == 4) ? "#b54708" : (code == 2 ? "#d93025" : "#b42318"))));
         if (sequenceActive_) {
             const int oneBased = sequenceIndex_ + 1;
-            const QString verb = (code == 0) ? "complete" : (code == 2 ? "stopped by safety cutoff" : (code == 3 ? "stopped manually" : "aborted"));
+            const QString verb = (code == 0) ? "complete" : (code == 2 ? "stopped by safety cutoff" : (code == 3 ? "stopped manually" : (code == 4 ? "auto-stopped (comms stall)" : "aborted")));
             appendConsole(QString("=== [Sequence %1/%2] Experiment %3 ===").arg(oneBased).arg(sequenceTotal_).arg(verb));
             statusBar()->showMessage(QString("Sequence %1/%2: %3").arg(oneBased).arg(sequenceTotal_).arg(verb));
         } else if (code == 0) {
@@ -1638,6 +1654,9 @@ private slots:
         } else if (code == 3) {
             appendConsole("=== Experiment stopped manually ===");
             statusBar()->showMessage("Manual emergency stop");
+        } else if (code == 4) {
+            appendConsole("=== Experiment auto-stopped: device stopped responding (communication stall) ===");
+            statusBar()->showMessage("Auto-stopped: communication stall");
         } else {
             appendConsole("=== Experiment aborted because of an error ===");
             statusBar()->showMessage("Experiment aborted: error");
@@ -2656,7 +2675,7 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         grpSafety_ = new QGroupBox("Safety");
         auto* safetyV = new QVBoxLayout(grpSafety_);
         auto* sh = new QHBoxLayout;
-        spnCutoff_ = dspin(35.0, 60.0, 45.0, 1, 0.5);
+        spnCutoff_ = dspin(35.0, 100.0, 45.0, 1, 0.5);
         sh->addWidget(new QLabel("Cutoff Temp"));
         sh->addWidget(spnCutoff_);
         sh->addWidget(new QLabel(QString::fromUtf8("°C")));
@@ -3300,9 +3319,18 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 
     void showExperimentSummary(int code) {
         logger_.flush();
-        const QString status = (code == 0) ? "completed" : (code == 2 ? "stopped by safety cutoff" : (code == 3 ? "stopped manually" : "aborted"));
+        const QString status = (code == 0) ? "completed" : (code == 2 ? "stopped by safety cutoff" : (code == 3 ? "stopped manually" : (code == 4 ? "stopped automatically (communication stall)" : "aborted")));
         QString msg;
         msg += QString("Experiment %1.\n\n").arg(status);
+        if (code == 4) {
+            msg += "The device stopped responding for longer than the stall "
+                   "watchdog timeout, so the run was ended automatically and an "
+                   "emergency STOP was sent. No operator action was taken.\n\n"
+                   "This usually means the ultrasound/FPGA link (UDP) or the COM3 "
+                   "serial connection briefly wedged. Check the network/USB cable, "
+                   "the device, and the UDP host/port before restarting. If the "
+                   "device is simply slow, raise watchdog_timeout_ms.\n\n";
+        }
         msg += qstr(logger_.error_summary_text());
         msg += "\nLog file:\n" + qstr(logger_.csv_path().string());
         msg += "\n\nMetadata file:\n" + qstr(logger_.meta_path().string());
@@ -3635,7 +3663,9 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         statusBar()->showMessage("Watchdog: worker stalled, cancelling pending I/O");
         lblCom3Status_->setStyleSheet(statusStyle("#d93025"));
         lblTempStatus_->setStyleSheet(statusStyle("#d93025"));
-        worker_->forceStop();
+        // watchdogStop (not forceStop): this is an automatic recovery, so it
+        // must report as a comms-stall stop (code 4), not an operator stop.
+        worker_->watchdogStop();
         btnStop_->setText(" ■  FORCE STOP ");
         btnStop_->setEnabled(true);
     }
@@ -3776,8 +3806,9 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         if (!sequenceActive_) return;
         if (sequenceStopRequested_) { finalizeSequence(/*ok=*/false); return; }
         // Exit codes from ExperimentRunner: 0=clean, 1=error, 2=cutoff,
-        // 3=manual stop. Any non-zero code is a "failed" config — abort the
-        // queue if the operator selected stop-on-error.
+        // 3=manual stop, 4=watchdog comms-stall stop. Any non-zero code is a
+        // "failed" config — abort the queue if the operator selected
+        // stop-on-error.
         if (sequenceStopOnError_ && code != 0) {
             appendConsole(QString("=== [Sequence] Aborting: configuration %1 ended with code %2 and 'stop on error' is enabled ===")
                               .arg(sequenceIndex_ + 1).arg(code));
