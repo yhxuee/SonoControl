@@ -65,6 +65,21 @@ LengthMode length_mode_from_string(const std::string& input) {
     throw std::invalid_argument("Unsupported length mode: " + input);
 }
 
+const char* to_string(DeviceKind kind) {
+    switch (kind) {
+        case DeviceKind::SonoControlFpga: return "sonocontrol_fpga";
+        case DeviceKind::Hyus: return "hyus";
+    }
+    return "sonocontrol_fpga";
+}
+
+DeviceKind device_kind_from_string(const std::string& input) {
+    const auto s = lower_copy(input);
+    if (s == "sonocontrol_fpga" || s == "sonocontrol" || s == "fpga" || s == "legacy") return DeviceKind::SonoControlFpga;
+    if (s == "hyus" || s == "lan" || s == "tcp") return DeviceKind::Hyus;
+    throw std::invalid_argument("Unsupported device kind: " + input);
+}
+
 } // namespace sonocontrol
 
 namespace sonocontrol::protocol {

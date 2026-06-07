@@ -59,6 +59,7 @@ void print_usage(const char* exe) {
         << "  --pid-kp X --pid-ki X --pid-kd X\n"
         << "  --pid-tau X            Thermal constant seconds for T_future=T+tau*dT/dt*(1-exp(-horizon/tau)); 0 disables prediction\n"
         << "  --pid-horizon X        Prediction horizon seconds; 0 uses current hardware interval\n"
+        << "  --temp-rate-window X   Temperature smoothing window seconds for the dT/dt fit, default 30 (range 5-600)\n"
         << "  --auto-save-dir DIR    Completed experiment artifact folder; also supported in .config\n"
         << "  --pid-duration         PID adjusts duration\n"
         << "  --pid-duty             PID adjusts duty cycle\n"
@@ -150,6 +151,7 @@ void validate_config(Config& c) {
     c.udp_port = std::max<uint16_t>(1, c.udp_port);
     c.pid_prediction_tau_s = std::clamp(c.pid_prediction_tau_s, 0.0, 3600.0);
     c.pid_prediction_horizon_s = std::clamp(c.pid_prediction_horizon_s, 0.0, 360.0);
+    c.temp_rate_window_s = std::clamp(c.temp_rate_window_s, 5.0, 600.0);
 }
 
 Config parse_args(int argc, char** argv, bool& protocol_check, bool& help, std::string& write_template_path) {
@@ -186,6 +188,7 @@ Config parse_args(int argc, char** argv, bool& protocol_check, bool& help, std::
         else if (a == "--pid-kd") c.pid_kd = parse_double(need_value(args, i, a), a);
         else if (a == "--pid-tau") c.pid_prediction_tau_s = parse_double(need_value(args, i, a), a);
         else if (a == "--pid-horizon") c.pid_prediction_horizon_s = parse_double(need_value(args, i, a), a);
+        else if (a == "--temp-rate-window") c.temp_rate_window_s = parse_double(need_value(args, i, a), a);
         else if (a == "--auto-save-dir") c.auto_save_dir = need_value(args, i, a);
         else if (a == "--pid-duration") c.pid_duration = true;
         else if (a == "--pid-duty") c.pid_duty = true;

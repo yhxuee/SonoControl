@@ -155,7 +155,8 @@ int ExperimentRunner::run() {
 
     bool predictor_initialized = false;
     double filtered_control_temp = 0.0;
-    // (t_rel_s, raw_temp) sliding window for the 30 s least-squares dT/dt fit.
+    // (t_rel_s, raw_temp) sliding window for the least-squares dT/dt fit. The
+    // window width is config_.temp_rate_window_s (default 30 s, GUI-editable).
     std::deque<std::pair<double, double>> rate_window;
 
     logger_.start_session(initial_params, config_);
@@ -297,12 +298,12 @@ int ExperimentRunner::run() {
                 // difference at 2 Hz is dominated by probe quantisation: ±0.1 °C
                 // of jitter over 0.5 s reads as ±0.2 °C/s — the entire clamp
                 // range — so the old rate was essentially noise. Instead fit a
-                // least-squares line over a 30 s sliding window and take its
-                // slope. The regression averages out per-sample noise while
+                // least-squares line over a sliding window (temp_rate_window_s,
+                // default 30 s) and take its slope. The regression averages out per-sample noise while
                 // still tracking real trends, and it runs on the *raw* channel
                 // average (not the EWMA) so the slope carries no filter lag —
                 // the fit itself is the smoother.
-                constexpr double kRateWindowSeconds = 30.0;
+                const double kRateWindowSeconds = std::clamp(config_.temp_rate_window_s, 5.0, 600.0);
                 rate_window.emplace_back(t_rel, avg);
                 while (rate_window.size() > 2 &&
                        t_rel - rate_window.front().first > kRateWindowSeconds) {

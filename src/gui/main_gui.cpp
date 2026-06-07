@@ -6,6 +6,15 @@
 #include "temperature.hpp"
 #include "serial_port.hpp"
 #include "udp_socket.hpp"
+#include "version.hpp"
+
+#include "hyus_protocol.hpp"
+#include "hyus_net.hpp"
+#include "pid.hpp"
+#include "device_dialog.hpp"
+
+#include <chrono>
+#include <thread>
 
 #if SONOCONTROL_WEB_SERVER
 #include "web_server.hpp"
@@ -97,6 +106,10 @@ Q_DECLARE_METATYPE(std::vector<float>)
 
 namespace {
 
+// Set by the window's "Switch Device" action; read by main() to re-show the
+// device-selection dialog after the current window closes.
+bool g_switchDeviceRequested = false;
+
 bool debug_sim_build() {
 #if SONOCONTROL_DEBUG_SIM
     return true;
@@ -161,6 +174,7 @@ void validate_config(sonocontrol::Config& c) {
     c.watchdog_timeout_ms = std::clamp(c.watchdog_timeout_ms, 1000, 60000);
     c.pid_prediction_tau_s = std::clamp(c.pid_prediction_tau_s, 0.0, 3600.0);
     c.pid_prediction_horizon_s = std::clamp(c.pid_prediction_horizon_s, 0.0, 360.0);
+    c.temp_rate_window_s = std::clamp(c.temp_rate_window_s, 5.0, 600.0);
     if (c.pid_enabled) {
         c.temperature_enabled = true;
     }
@@ -380,6 +394,218 @@ private:
     std::vector<float> data_;
 };
 
+// Pulse-train schematic shared by both devices. A *not-to-scale* diagram of one
+// burst: pulse 1 and pulse 2 sit close together (one pulse period, solid divider
+// between them); pulse 3 is the start of the next sequence, drawn after a larger
+// gap with dashed dividers (an ellipsis for the rest of the burst + the off
+// time). Labelled dimensions top-to-bottom: pulse amplitude, pulse length, pulse
+// period, sequence length, sequence period, and (total-duration mode) repeating
+// cycles. For the Zhuhai device the values are derived from PRF/duty/Duration/
+// Interval; for Hyus they are the native pulse/sequence parameters.
+class PulseSequencePlot final : public QWidget {
+public:
+    explicit PulseSequencePlot(QWidget* parent = nullptr) : QWidget(parent) {
+        setMinimumHeight(300);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    }
+    void setParams(double ampPct, double pulseLenUs, double pulsePeriodUs,
+                   double seqLenMs, double seqPeriodMs, const QString& spanLabel, bool showSpan) {
+        ampPct_ = ampPct; pulseLenUs_ = pulseLenUs; pulsePeriodUs_ = pulsePeriodUs;
+        seqLenMs_ = seqLenMs; seqPeriodMs_ = seqPeriodMs;
+        spanLabel_ = spanLabel; showSpan_ = showSpan;
+        update();
+    }
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        p.setRenderHint(QPainter::TextAntialiasing, true);
+        p.fillRect(rect(), QColor(Theme::chartBg()));
+
+        {
+            const QRectF area = rect().adjusted(8, 8, -8, -8);
+            constexpr double barW = 28.0;
+            constexpr double pulsePeriodPx = 50.0;
+            constexpr double seqLenPx = pulsePeriodPx * 2.0 + barW;
+            constexpr double seqPeriodPx = 225.0;
+            constexpr double finalSeqStartPx = 530.0;
+            constexpr double totalPx = finalSeqStartPx + seqLenPx;
+
+            const double sx = area.width() / totalPx;
+            const double x0 = area.left();
+            auto X = [&](double px) { return x0 + px * sx; };
+
+            const double pulseTop = area.top() + 2.0;
+            const double dimReserve = showSpan_ ? 118.0 : 98.0;
+            const double pulseBottom = std::max(pulseTop + 92.0, area.bottom() - dimReserve);
+            const double centerY = pulseTop + (pulseBottom - pulseTop) * 0.50;
+            const double bw = std::max(7.0, barW * sx);
+
+            const QColor pulseColor(Theme::isDark() ? "#60a5fa" : "#5b8fe3");
+            const QColor lineColor(Theme::isDark() ? "#93c5fd" : "#4d86e8");
+            const QColor labelColor(Theme::isDark() ? "#bfdbfe" : "#15599b");
+            QPen guidePen(lineColor, 1.0, Qt::DashLine);
+            guidePen.setDashPattern({3.0, 3.0});
+
+            p.setPen(QPen(lineColor, 1.0));
+            p.drawLine(QPointF(area.left(), centerY), QPointF(area.right(), centerY));
+
+            p.setPen(Qt::NoPen);
+            p.setBrush(pulseColor);
+            const double starts[] = {0.0, seqPeriodPx, finalSeqStartPx};
+            for (double seqStart : starts) {
+                for (int i = 0; i < 3; ++i) {
+                    const double x = X(seqStart + pulsePeriodPx * i);
+                    p.drawRect(QRectF(x, pulseTop, bw, pulseBottom - pulseTop));
+                }
+            }
+
+            QFont f = p.font();
+            f.setPointSize(10);
+            f.setBold(false);
+            p.setFont(f);
+
+            auto arrowHeadH = [&](const QPointF& tip, int dir) {
+                QPolygonF tri;
+                tri << tip
+                    << QPointF(tip.x() + dir * 9.0, tip.y() - 5.0)
+                    << QPointF(tip.x() + dir * 9.0, tip.y() + 5.0);
+                p.drawPolygon(tri);
+            };
+            auto arrowHeadV = [&](const QPointF& tip, int dir) {
+                QPolygonF tri;
+                tri << tip
+                    << QPointF(tip.x() - 5.0, tip.y() + dir * 9.0)
+                    << QPointF(tip.x() + 5.0, tip.y() + dir * 9.0);
+                p.drawPolygon(tri);
+            };
+            auto drawGuide = [&](double x, double y1, double y2) {
+                p.setPen(guidePen);
+                p.drawLine(QPointF(x, y1), QPointF(x, y2));
+            };
+            auto drawDimH = [&](double xa, double xb, double y, const QString& text) {
+                if (xb < xa) std::swap(xa, xb);
+                p.setPen(QPen(lineColor, 1.4));
+                p.setBrush(lineColor);
+                p.drawLine(QPointF(xa, y), QPointF(xb, y));
+                arrowHeadH(QPointF(xa, y), 1);
+                arrowHeadH(QPointF(xb, y), -1);
+                p.setPen(labelColor);
+                const double w = std::max(28.0, xb - xa);
+                p.drawText(QRectF((xa + xb) / 2.0 - w / 2.0, y - 20.0, w, 18.0),
+                           Qt::AlignCenter, text);
+            };
+
+            const double p0 = X(0.0);
+            const double p1 = X(pulsePeriodPx);
+            const double p2End = X(seqLenPx);
+            const double nextSeq = X(seqPeriodPx);
+            const double finalEnd = X(finalSeqStartPx + seqLenPx);
+            const double yBase = pulseBottom + 10.0;
+            const double rowGap = 28.0;
+
+            drawGuide(p0, pulseBottom, area.bottom());
+            drawGuide(X(barW), pulseBottom, yBase + 4.0);
+            drawDimH(p0, X(barW), yBase, fmtNum(pulseLenUs_));
+
+            drawGuide(p1, pulseBottom, yBase + rowGap + 4.0);
+            drawDimH(p0, p1, yBase + rowGap, fmtNum(pulsePeriodUs_));
+
+            drawGuide(p2End, pulseBottom, yBase + rowGap * 2.0 + 4.0);
+            drawDimH(p0, p2End, yBase + rowGap * 2.0, fmtNum(seqLenMs_));
+
+            drawGuide(nextSeq, pulseBottom, yBase + rowGap * 3.0 + 4.0);
+            drawDimH(p0, nextSeq, yBase + rowGap * 3.0, fmtNum(seqPeriodMs_));
+
+            if (showSpan_) {
+                drawGuide(finalEnd, pulseBottom, yBase + rowGap * 4.0 + 4.0);
+                drawDimH(p0, finalEnd, yBase + rowGap * 4.0,
+                         spanLabel_.isEmpty() ? QStringLiteral("-") : spanLabel_);
+            }
+
+            const double ampX = X(seqPeriodPx + seqLenPx) + 20.0;
+            p.setPen(guidePen);
+            p.drawLine(QPointF(X(seqPeriodPx + seqLenPx), pulseTop), QPointF(ampX + 24.0, pulseTop));
+            p.drawLine(QPointF(ampX + 24.0, centerY), QPointF(area.right(), centerY));
+            p.setPen(QPen(lineColor, 1.4));
+            p.setBrush(lineColor);
+            p.drawLine(QPointF(ampX, pulseTop + 6.0), QPointF(ampX, centerY - 6.0));
+            arrowHeadV(QPointF(ampX, pulseTop + 6.0), 1);
+            arrowHeadV(QPointF(ampX, centerY - 6.0), -1);
+            p.setPen(labelColor);
+            p.drawText(QRectF(ampX + 12.0, (pulseTop + centerY) / 2.0 - 10.0, 64.0, 20.0),
+                       Qt::AlignLeft | Qt::AlignVCenter, fmtNum(ampPct_) + "%");
+        }
+    }
+private:
+    static QString fmtNum(double v) {
+        if (std::abs(v - std::round(v)) < 1e-9) return QString::number(static_cast<long long>(std::llround(v)));
+        return QString::number(v, 'g', 4);
+    }
+    double ampPct_ = 50.0, pulseLenUs_ = 160.0, pulsePeriodUs_ = 400.0;
+    double seqLenMs_ = 1.0, seqPeriodMs_ = 1000.0;
+    QString spanLabel_ = QStringLiteral("60");
+    bool showSpan_ = true;
+};
+
+// AC mains status: 1 = power cord plugged in (AC), 0 = running on battery,
+// -1 = unknown (call failed, or a desktop without a battery).
+inline int acLineStatus() {
+#ifdef _WIN32
+    SYSTEM_POWER_STATUS sps{};
+    if (GetSystemPowerStatus(&sps)) {
+        if (sps.ACLineStatus == 0) return 0;  // offline -> on battery
+        if (sps.ACLineStatus == 1) return 1;  // online  -> AC
+    }
+    return -1;  // 255 = unknown
+#else
+    return -1;
+#endif
+}
+
+// Large battery icon for the preflight dialog: green when on AC mains, yellow
+// when on battery (so the operator notices the PC could die mid-run), grey when
+// unknown.
+class BatteryIndicator final : public QWidget {
+public:
+    explicit BatteryIndicator(QWidget* parent = nullptr) : QWidget(parent) {
+        setFixedSize(150, 66);
+    }
+    void setStatus(int s) { if (s != status_) { status_ = s; update(); } }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        const bool ac = (status_ == 1);
+        const bool unknown = (status_ < 0);
+        const QColor fill = unknown ? QColor("#98a2b3") : (ac ? QColor("#1e8e3e") : QColor("#f5b301"));
+
+        const QRectF body(6, 8, 104, 38);
+        const QRectF cap(110, 20, 10, 14);
+        p.setPen(QPen(QColor("#344054"), 3));
+        p.setBrush(Qt::NoBrush);
+        p.drawRoundedRect(body, 6, 6);
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor("#344054"));
+        p.drawRoundedRect(cap, 2, 2);
+        p.setBrush(fill);
+        p.drawRoundedRect(body.adjusted(5, 5, -5, -5), 4, 4);
+
+        p.setPen(QColor("#ffffff"));
+        QFont f = p.font(); f.setBold(true); f.setPointSize(12); p.setFont(f);
+        p.drawText(body, Qt::AlignCenter, ac ? "AC" : (unknown ? "?" : "BATT"));
+
+        p.setPen(QColor(unknown ? "#667085" : (ac ? "#1e8e3e" : "#b54708")));
+        QFont cf = p.font(); cf.setBold(true); cf.setPointSize(8); p.setFont(cf);
+        p.drawText(QRectF(0, 48, width(), 16), Qt::AlignCenter,
+                   ac ? "Power plugged in" : (unknown ? "Power: unknown" : "ON BATTERY"));
+    }
+
+private:
+    int status_ = -1;
+};
+
 // Apple-style PIN code entry: a row of N separate digit boxes (visible
 // digits, no echo masking). Each box accepts one digit; entering one auto-
 // advances focus to the next; Backspace on an empty box jumps back and
@@ -589,6 +815,172 @@ private:
     sonocontrol::ExperimentLogger* logger_ = nullptr;
     std::unique_ptr<sonocontrol::ExperimentRunner> runner_;
     std::atomic<sonocontrol::ExperimentRunner*> runnerRaw_{nullptr};
+};
+
+// Active control loop for a Hyus run: temperature sampling, safety cutoff, PID,
+// and heating/cooling cycling. Unlike the FPGA ExperimentRunner it does NOT
+// re-transmit a waveform — the device self-clocks, so PID/cycle act by sending
+// single live parameter/run frames over the held TCP connection while the run
+// continues uninterrupted. Runs on its own QThread; sends via HyusDiscovery
+// (owned by the window, which stops this worker before tearing the discovery
+// down). Reuses PIDController and the shared temperature sensors.
+class HyusRunWorker final : public QObject {
+    Q_OBJECT
+public:
+    HyusRunWorker(sonocontrol::Config cfg, std::string ip, sonocontrol::hyus::HyusDiscovery* disc)
+        : cfg_(std::move(cfg)), ip_(std::move(ip)), disc_(disc) {}
+    void requestStop() { stop_.store(true); }
+
+public slots:
+    void run() {
+        using namespace sonocontrol;
+        namespace hp = sonocontrol::hyus;
+
+        std::unique_ptr<ITemperatureSensor> sensor;
+        if (!cfg_.temperature_enabled) sensor = std::make_unique<NullTemperatureSensor>();
+        else if (cfg_.simulate_temp) sensor = std::make_unique<TemperatureSimulator>();
+        else sensor = std::make_unique<HH806AUSensor>(cfg_.com11_port, cfg_.min_plausible_temp_c,
+                                                      cfg_.max_plausible_temp_c, cfg_.max_temp_rate_c_per_s);
+
+        auto sendParam = [&](hp::Cmd cmd, uint32_t v) {
+            const auto f = hp::write_param(cmd, v);
+            if (disc_) disc_->send(ip_, f.data(), f.size());
+        };
+
+        PIDController pid(cfg_.pid_kp, cfg_.pid_ki, cfg_.pid_kd);
+
+        const double seq_period_s = cfg_.hyus_seq_period_ms / 1000.0;
+        const double total_s = (cfg_.length_mode == LengthMode::TotalDuration)
+            ? cfg_.total_duration_mins * 60.0
+            : (cfg_.length_mode == LengthMode::RepeatingCycles
+                ? static_cast<double>(cfg_.repeating) * seq_period_s : 0.0);
+        const double hold_after_target_s = std::max(0.0, cfg_.hold_after_target_mins * 60.0);
+        const double target_tolerance = std::max(0.0, cfg_.target_tolerance_c);
+        bool target_hold_started = false;
+        auto target_hold_start = std::chrono::steady_clock::now();
+        const double sampling_period = 1.0 / std::max(0.1, cfg_.sampling_rate_hz);
+        const bool cycling = cfg_.use_cycling && cfg_.length_mode == LengthMode::TotalDuration;
+
+        // Upper limits for the selected PID knob (configured value = full scale).
+        const double ampUpperPct = std::clamp(cfg_.amplitude * 100.0, 0.0, 100.0);
+        const double pulseDutyUpper = (cfg_.hyus_pulse_period_us > 0.0)
+            ? std::clamp(cfg_.hyus_pulse_len_us / cfg_.hyus_pulse_period_us, 0.0, 1.0) : 0.0;
+        const double seqDutyUpper = (cfg_.hyus_seq_period_ms > 0.0)
+            ? std::clamp(cfg_.hyus_seq_len_ms / cfg_.hyus_seq_period_ms, 0.0, 1.0) : 0.0;
+
+        auto applyDemand = [&](double demand) {
+            demand = std::clamp(demand, 0.0, 1.0);
+            switch (cfg_.hyus_pid_var) {
+                case 0: sendParam(hp::Cmd::Amplitude, hp::encode_amplitude_percent(demand * ampUpperPct)); break;
+                case 2: sendParam(hp::Cmd::SeqLen, hp::encode_seq_len_ms(demand * seqDutyUpper * cfg_.hyus_seq_period_ms)); break;
+                default: sendParam(hp::Cmd::PulseLen, hp::encode_pulse_len_us(demand * pulseDutyUpper * cfg_.hyus_pulse_period_us)); break;
+            }
+        };
+
+        const auto start = std::chrono::steady_clock::now();
+        auto nextSample = start;
+        auto phaseStart = start;
+        enum class Phase { Heating, Cooling } phase = Phase::Heating;
+        int overCutoff = 0;
+        emit cycle(cfg_.length_mode == LengthMode::HoldAfterTarget ? QStringLiteral("WAIT TARGET")
+                                                                    : QStringLiteral("HEATING"));
+
+        while (!stop_.load()) {
+            const auto now = std::chrono::steady_clock::now();
+            const double elapsed = std::chrono::duration<double>(now - start).count();
+            double remaining = std::max(0.0, total_s - elapsed);
+            if (cfg_.length_mode == LengthMode::HoldAfterTarget) {
+                if (target_hold_started) {
+                    const double held = std::chrono::duration<double>(now - target_hold_start).count();
+                    remaining = std::max(0.0, hold_after_target_s - held);
+                    if (held >= hold_after_target_s) break;
+                } else {
+                    remaining = hold_after_target_s;
+                }
+            } else if (total_s > 0.0 && elapsed >= total_s) {
+                break;
+            }
+
+            if (cfg_.temperature_enabled && now >= nextSample) {
+                nextSample = now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                       std::chrono::duration<double>(sampling_period));
+                const auto [t1, t2] = sensor->read();
+                std::optional<double> ctrl;
+                if (cfg_.temp_channel == TempChannel::T1) ctrl = t1 ? t1 : (cfg_.temp_channel_fallback ? t2 : std::nullopt);
+                else if (cfg_.temp_channel == TempChannel::T2) ctrl = t2 ? t2 : (cfg_.temp_channel_fallback ? t1 : std::nullopt);
+                else { if (t1 && t2) ctrl = (*t1 + *t2) / 2.0; else ctrl = t1 ? t1 : t2; }
+
+                emit temperature(t1 ? *t1 : std::numeric_limits<double>::quiet_NaN(),
+                                 t2 ? *t2 : std::numeric_limits<double>::quiet_NaN());
+
+                if (ctrl) {
+                    if (*ctrl >= cfg_.cutoff_temp) {
+                        if (++overCutoff >= std::max(1, cfg_.cutoff_confirm_samples)) {
+                            sendParam(hp::Cmd::Run, 0u);
+                            emit console(QString("[SAFETY] Cutoff at %1 C — stopping.").arg(*ctrl, 0, 'f', 2));
+                            emit cutoff(*ctrl);
+                            emit finished(2);
+                            return;
+                        }
+                    } else {
+                        overCutoff = 0;
+                    }
+                    if (cfg_.length_mode == LengthMode::HoldAfterTarget && !target_hold_started) {
+                        if (std::abs(*ctrl - cfg_.pid_setpoint) <= target_tolerance) {
+                            target_hold_started = true;
+                            target_hold_start = now;
+                            emit console(QString("Target reached: %1 C is within +/- %2 C of setpoint %3 C. Hold timer started for %4 s.")
+                                             .arg(*ctrl, 0, 'f', 2)
+                                             .arg(target_tolerance, 0, 'f', 2)
+                                             .arg(cfg_.pid_setpoint, 0, 'f', 2)
+                                             .arg(hold_after_target_s, 0, 'f', 1));
+                            emit cycle(QStringLiteral("TARGET HOLD"));
+                        }
+                    }
+                    const bool heatingPid = cfg_.pid_enabled && phase == Phase::Heating;
+                    const bool coolHoldPid = cfg_.pid_enabled && cycling && phase == Phase::Cooling
+                                             && cfg_.cooling_mode == CoolingMode::Low;
+                    if (heatingPid || coolHoldPid) {
+                        const double sp = (phase == Phase::Cooling) ? cfg_.cooling_hold_temp : cfg_.pid_setpoint;
+                        applyDemand(pid.compute(sp, *ctrl));
+                    }
+                }
+            }
+
+            if (cycling) {
+                const double pe = std::chrono::duration<double>(now - phaseStart).count();
+                if (phase == Phase::Heating && pe >= cfg_.heating_s) {
+                    phase = Phase::Cooling; phaseStart = now; pid.reset();
+                    if (cfg_.cooling_mode == CoolingMode::Stop) { sendParam(hp::Cmd::Run, 0u); emit cycle(QStringLiteral("COOLING")); }
+                    else emit cycle(QStringLiteral("COOLING HOLD"));
+                } else if (phase == Phase::Cooling && pe >= cfg_.cooling_s) {
+                    phase = Phase::Heating; phaseStart = now; pid.reset();
+                    if (cfg_.cooling_mode == CoolingMode::Stop) sendParam(hp::Cmd::Run, 1u);  // resume output
+                    emit cycle(QStringLiteral("HEATING"));
+                }
+            }
+
+            emit timeUpdate(elapsed, remaining);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        sendParam(hp::Cmd::Run, 0u);  // stop on normal end or user stop
+        emit finished(stop_.load() ? 3 : 0);
+    }
+
+signals:
+    void console(QString);
+    void temperature(double, double);
+    void timeUpdate(double, double);
+    void cycle(QString);
+    void cutoff(double);
+    void finished(int);
+
+private:
+    sonocontrol::Config cfg_;
+    std::string ip_;
+    sonocontrol::hyus::HyusDiscovery* disc_ = nullptr;
+    std::atomic<bool> stop_{false};
 };
 
 // Lightweight background probe that updates the COM3 / UDP / Temp status pills
@@ -1288,8 +1680,15 @@ QString SequenceDialog::itemDetail(const SequenceItem& it) {
 class SonoControlWindow final : public QMainWindow {
     Q_OBJECT
 public:
-    explicit SonoControlWindow(QWidget* parent = nullptr) : QMainWindow(parent) {
-        setWindowTitle("SonoControl  ·  Ultrasound Temperature Controller");
+    explicit SonoControlWindow(sonocontrol::DeviceKind deviceKind = sonocontrol::DeviceKind::SonoControlFpga,
+                               QWidget* parent = nullptr)
+        : QMainWindow(parent), deviceKind_(deviceKind) {
+        // deviceKind_ is set before buildUi() so the tab/connect layout can be
+        // tailored to the selected device as it is constructed.
+        setWindowTitle(QString("SonoControl  ·  %1")
+                           .arg(deviceKind_ == sonocontrol::DeviceKind::Hyus
+                                    ? "Hyus (LAN) Controller"
+                                    : "Ultrasound Temperature Controller"));
         setMinimumSize(1600, 900);
         // Auto-detect theme by time of day: dark from 17:00 to 08:00.
         Theme::setDark(isNightTime());
@@ -1298,6 +1697,7 @@ public:
         buildUi();
         refreshPorts();
         updateRepeatingFromDuration();
+        updateSequencePreview();
         onPidChanged(false);
         // Idle timer disabled — no background sensor polling.
 
@@ -1332,12 +1732,26 @@ public:
         // time it is armed in handleSequenceItemFinished().
         sequenceIntervalTimer_.setSingleShot(true);
         connect(&sequenceIntervalTimer_, &QTimer::timeout, this, &SonoControlWindow::onSequenceIntervalElapsed);
+
+        // Hyus LAN discovery: poll the background service ~1 Hz to refresh the
+        // device dropdown. Discovery itself runs only for the Hyus device.
+        hyusScanTimer_.setInterval(1000);
+        connect(&hyusScanTimer_, &QTimer::timeout, this, &SonoControlWindow::refreshHyusDevices);
+        hyusStopTimer_.setSingleShot(true);
+        connect(&hyusStopTimer_, &QTimer::timeout, this, &SonoControlWindow::onHyusRunFinished);
+        if (deviceKind_ == sonocontrol::DeviceKind::Hyus) startHyusDiscovery();
     }
 
     ~SonoControlWindow() override {
         shutdownInProgress_ = true;
         sequenceActive_ = false;
         sequenceIntervalTimer_.stop();
+        hyusScanTimer_.stop();
+        hyusStopTimer_.stop();
+        if (hyusWorker_) hyusWorker_->requestStop();
+        if (hyusWorkerThread_) { hyusWorkerThread_->quit(); hyusWorkerThread_->wait(2000); }
+        sendHyusSafetyStop();  // stop output before dropping the connection
+        if (hyusDiscovery_) hyusDiscovery_->stop();
         teardownStatusProbe();
 #if SONOCONTROL_WEB_SERVER
         if (webServer_) webServer_->stop();
@@ -1351,6 +1765,12 @@ protected:
         shutdownInProgress_ = true;
         sequenceActive_ = false;
         sequenceIntervalTimer_.stop();
+        hyusScanTimer_.stop();
+        hyusStopTimer_.stop();
+        if (hyusWorker_) hyusWorker_->requestStop();
+        if (hyusWorkerThread_) { hyusWorkerThread_->quit(); hyusWorkerThread_->wait(2000); }
+        sendHyusSafetyStop();  // stop output before dropping the connection
+        if (hyusDiscovery_) hyusDiscovery_->stop();
         teardownStatusProbe();
 #if SONOCONTROL_WEB_SERVER
         if (webServer_) webServer_->stop();
@@ -1364,6 +1784,10 @@ private slots:
     void onStart() {
         if (running_) return;
         if (sequenceActive_) return;  // main Start is disabled while a sequence is queued, but guard regardless
+        if (deviceKind_ == sonocontrol::DeviceKind::Hyus) {
+            onStartHyus();
+            return;
+        }
         config_ = buildConfig();
         attachActiveConfigProvenance(config_);
         validate_config(config_);
@@ -1568,6 +1992,17 @@ private slots:
         if (path.isEmpty()) return;
         try {
             auto cfg = sonocontrol::load_config_file(path.toStdString());
+            // Device recognition: a config saved for one device must not be
+            // loaded onto a session running the other device.
+            if (cfg.device_kind != deviceKind_) {
+                QMessageBox::critical(this, "Device mismatch",
+                    QString("This configuration is for the '%1' device, but the current "
+                            "session is running the '%2' device.\n\nStart the software and "
+                            "select the matching device, then load this configuration.")
+                        .arg(deviceDisplayName(cfg.device_kind))
+                        .arg(deviceDisplayName(deviceKind_)));
+                return;
+            }
             validate_config(cfg);
             loadingConfigUi_ = true;
             applyConfigToUi(cfg);
@@ -1738,6 +2173,9 @@ private slots:
 
     void onParams(sonocontrol::ActiveParams p) {
         touchWorkerSignal();
+        // The Hyus device repurposes the Active Parameters labels (populated by
+        // updateSequencePreview); its runtime does not emit FPGA ActiveParams.
+        if (deviceKind_ == sonocontrol::DeviceKind::Hyus) return;
         lblCurAmp_->setText(QString::number(p.amplitude, 'f', 3));
         lblCurCfreq_->setText(QString::number(p.cfreq_hz / 1000.0, 'f', 1) + " kHz");
         lblCurPrf_->setText(QString::number(p.prf_hz, 'f', 0) + " Hz");
@@ -1784,7 +2222,7 @@ private slots:
         lblCycle_->setStyleSheet(valueStyle(phase.contains("HEAT") || phase.contains("TARGET") ? "#0a9e8a" : "#5a6070"));
     }
 
-    void onWaveform(std::vector<float> w) { touchWorkerSignal(); waveformPlot_->setWaveform(std::move(w)); }
+    void onWaveform(std::vector<float> w) { touchWorkerSignal(); if (waveformPlot_) waveformPlot_->setWaveform(std::move(w)); }
 
     void onCutoff(double temp) {
         fatalErrorShown_ = true;
@@ -1819,10 +2257,19 @@ private slots:
         console_->appendPlainText("[" + QTime::currentTime().toString("HH:mm:ss") + "] " + msg);
     }
 
+    // Per-cycle period in seconds used by the duration <-> repeating
+    // relationship. For the FPGA box this is the transmit Interval; for Hyus it
+    // is the Sequence Period (total duration = repeating × sequence period).
+    double cyclePeriodSeconds() const {
+        if (deviceKind_ == sonocontrol::DeviceKind::Hyus)
+            return spnHyusSeqPeriodMs_ ? spnHyusSeqPeriodMs_->value() / 1000.0 : 0.0;
+        return spnInterval_ ? spnInterval_->value() : 0.0;
+    }
+
     void updateRepeatingFromDuration() {
-        const double interval = spnInterval_->value();
-        if (interval <= 0.0 || !spnRepeating_) return;
-        const int reps = std::max(1, static_cast<int>((spnTotalDur_->value() * 60.0) / interval));
+        const double period = cyclePeriodSeconds();
+        if (period <= 0.0 || !spnRepeating_) return;
+        const int reps = std::max(1, static_cast<int>((spnTotalDur_->value() * 60.0) / period));
         QSignalBlocker b(spnRepeating_);
         spnRepeating_->setValue(reps);
         updateLengthModeUi();
@@ -1831,7 +2278,411 @@ private slots:
     void updateDurationFromRepeating() {
         if (!rbRepeating_ || !rbRepeating_->isChecked()) return;
         QSignalBlocker b(spnTotalDur_);
-        spnTotalDur_->setValue((spnRepeating_->value() * spnInterval_->value()) / 60.0);
+        spnTotalDur_->setValue((spnRepeating_->value() * cyclePeriodSeconds()) / 60.0);
+        updateSequencePreview();
+    }
+
+    // Refresh the pulse-sequence schematic (both devices) and, for Hyus, the
+    // Active Parameters panel, from the current PARAMS-tab inputs. For Zhuhai the
+    // schematic values are derived: pulse period = 1/PRF, pulse length =
+    // duty/PRF, sequence length = Duration, sequence period = Interval.
+    void updateSequencePreview() {
+        if (!seqPlot_) return;
+        const bool totalMode = rbTotalDur_ && rbTotalDur_->isChecked();
+        auto fmtPreviewNum = [](double v) {
+            return (std::abs(v - std::round(v)) < 1e-9) ? QString::number(static_cast<long long>(std::llround(v)))
+                                                        : QString::number(v, 'g', 4);
+        };
+        const QString spanLabel = (totalMode && spnTotalDur_) ? fmtPreviewNum(spnTotalDur_->value() * 60.0) : QString();
+        const int reps = spnRepeating_ ? spnRepeating_->value() : 0;
+        if (deviceKind_ == sonocontrol::DeviceKind::Hyus) {
+            const double ampPct = spnHyusAmpPct_ ? spnHyusAmpPct_->value() : 50.0;
+            const double pLen = spnHyusPulseLenUs_ ? spnHyusPulseLenUs_->value() : 160.0;
+            const double pPer = spnHyusPulsePeriodUs_ ? spnHyusPulsePeriodUs_->value() : 400.0;
+            const double sLen = spnHyusSeqLenMs_ ? spnHyusSeqLenMs_->value() : 1.0;
+            const double sPer = spnHyusSeqPeriodMs_ ? spnHyusSeqPeriodMs_->value() : 1000.0;
+            seqPlot_->setParams(ampPct, pLen, pPer, sLen, sPer, spanLabel, totalMode);
+            auto num = [](double v) {
+                return (std::abs(v - std::round(v)) < 1e-9) ? QString::number(static_cast<long long>(std::llround(v)))
+                                                            : QString::number(v, 'g', 4);
+            };
+            if (lblCurAmp_) lblCurAmp_->setText(num(ampPct) + "%");
+            if (lblCurCfreq_) lblCurCfreq_->setText(num(pLen) + " us");
+            if (lblCurPrf_) lblCurPrf_->setText(num(pPer) + " us");
+            if (lblCurDuty_) lblCurDuty_->setText(num(sLen) + " ms");
+            if (lblCurDur_) lblCurDur_->setText(num(sPer) + " ms");
+            if (lblCurIntv_) lblCurIntv_->setText(totalMode ? (QString::number(reps) + " cyc") : QString("(set)"));
+        } else {
+            const double prf = (spnPrf_ && spnPrf_->value() > 0.0) ? spnPrf_->value() : 1.0;
+            const double ampPct = spnAmp_ ? spnAmp_->value() * 100.0 : 50.0;
+            const double pPer = 1.0e6 / prf;                                   // us
+            const double pLen = (spnDuty_ ? spnDuty_->value() / 100.0 : 0.5) * 1.0e6 / prf;  // us
+            const double sLen = spnDuration_ ? spnDuration_->value() : 0.0;     // ms
+            const double sPer = spnInterval_ ? spnInterval_->value() * 1000.0 : 0.0;  // ms
+            seqPlot_->setParams(ampPct, pLen, pPer, sLen, sPer, spanLabel, totalMode);
+        }
+    }
+
+    // Live timing constraints for Hyus: length <= period (pulse and sequence)
+    // and pulse period <= sequence length. Enforced as dynamic spinbox ranges so
+    // invalid values cannot be entered. Signals are blocked to avoid recursion.
+    void enforceHyusTiming() {
+        if (!spnHyusPulseLenUs_ || !spnHyusPulsePeriodUs_ || !spnHyusSeqLenMs_ || !spnHyusSeqPeriodMs_) return;
+        QSignalBlocker b1(spnHyusPulseLenUs_), b2(spnHyusPulsePeriodUs_), b3(spnHyusSeqLenMs_), b4(spnHyusSeqPeriodMs_);
+        const double seqLenUs = spnHyusSeqLenMs_->value() * 1000.0;
+        // pulse period in [pulse length, sequence length]
+        spnHyusPulsePeriodUs_->setMinimum(spnHyusPulseLenUs_->value());
+        spnHyusPulsePeriodUs_->setMaximum(std::max(spnHyusPulseLenUs_->value(), seqLenUs));
+        // pulse length <= pulse period
+        spnHyusPulseLenUs_->setMaximum(spnHyusPulsePeriodUs_->value());
+        // sequence length in [pulse period, sequence period]
+        spnHyusSeqLenMs_->setMinimum(spnHyusPulsePeriodUs_->value() / 1000.0);
+        spnHyusSeqLenMs_->setMaximum(spnHyusSeqPeriodMs_->value());
+        // sequence period >= sequence length
+        spnHyusSeqPeriodMs_->setMinimum(spnHyusSeqLenMs_->value());
+    }
+
+    // Live timing constraints for Zhuhai: sequence length (Duration) <= sequence
+    // period (Interval). validate_config already keeps interval >= duration, so
+    // these ranges never alter a freshly-loaded config. (pulse length <= pulse
+    // period is automatic since duty <= 100%; pulse period <= sequence length is
+    // checked at preflight.)
+    void enforceZhuhaiTiming() {
+        if (!spnDuration_ || !spnInterval_) return;
+        QSignalBlocker bD(spnDuration_), bI(spnInterval_);
+        spnInterval_->setMinimum(std::max(sonocontrol::kMinIntervalTimeS, spnDuration_->value() / 1000.0));
+        spnDuration_->setMaximum(spnInterval_->value() * 1000.0);
+    }
+
+    // ---- Hyus LAN discovery / connection ----
+    void startHyusDiscovery() {
+        if (!hyusDiscovery_) hyusDiscovery_ = std::make_unique<sonocontrol::hyus::HyusDiscovery>();
+        if (!hyusDiscovery_->start(8192, 8193)) {
+            if (lblHyusStatus_) lblHyusStatus_->setText("Cannot start discovery: " +
+                                                        QString::fromStdString(hyusDiscovery_->lastError()));
+            return;
+        }
+        hyusScanTimer_.start();
+        refreshHyusDevices();
+    }
+
+    void rescanHyusDevices() {
+        if (!hyusDiscovery_) { startHyusDiscovery(); return; }
+        // A full restart clears stale entries and re-broadcasts immediately.
+        hyusDiscovery_->stop();
+        if (cmbHyusDevice_) cmbHyusDevice_->clear();
+        hyusKnownDevices_.clear();  // re-push init when devices reconnect
+        startHyusDiscovery();
+    }
+
+    void refreshHyusDevices() {
+        if (!hyusDiscovery_ || !cmbHyusDevice_) return;
+        const auto devs = hyusDiscovery_->devices();
+        const QString prev = cmbHyusDevice_->currentText();
+        QStringList items;
+        for (const auto& d : devs) items << QString::fromStdString(d);
+        // Init is pushed on user selection (QComboBox::activated), not here.
+        hyusKnownDevices_ = items;
+        // Only rebuild when the set actually changed, to keep the user's
+        // selection and avoid dropdown flicker.
+        QStringList current;
+        for (int i = 0; i < cmbHyusDevice_->count(); ++i) current << cmbHyusDevice_->itemText(i);
+        if (items != current) {
+            QSignalBlocker b(cmbHyusDevice_);
+            cmbHyusDevice_->clear();
+            cmbHyusDevice_->addItems(items);
+            const int idx = items.indexOf(prev);
+            if (idx >= 0) cmbHyusDevice_->setCurrentIndex(idx);
+        }
+        if (lblHyusStatus_) {
+            lblHyusStatus_->setText(devs.empty()
+                ? "Listening on TCP 8192 — no device connected yet."
+                : QString("Connected: %1 device(s).").arg(static_cast<int>(devs.size())));
+        }
+        // Header LAN pill: green once at least one device is detected on the LAN.
+        if (lblLanStatus_) lblLanStatus_->setStyleSheet(statusStyle(devs.empty() ? "#b54708" : "#1e8e3e"));
+    }
+
+    QString selectedHyusDevice() const {
+        return cmbHyusDevice_ ? cmbHyusDevice_->currentText().trimmed() : QString();
+    }
+
+    // Send a single PREFIX+PARAM frame to the selected device immediately. Used
+    // for live parameter edits (the device accepts changes whether or not it is
+    // running). No-op if no device is connected.
+    void sendHyusParam(sonocontrol::hyus::Cmd cmd, uint32_t value) {
+        if (deviceKind_ != sonocontrol::DeviceKind::Hyus || !hyusDiscovery_) return;
+        if (loadingConfigUi_) return;  // don't push frames while a config is being applied
+        const QString ip = selectedHyusDevice();
+        if (ip.isEmpty()) return;
+        const auto f = sonocontrol::hyus::write_param(cmd, value);
+        hyusDiscovery_->send(ip.toStdString(), f.data(), f.size());
+    }
+
+    // Full initial-connection parameter download (matches the 353-byte batch in
+    // all.pcapng). Sent ONCE when a device first connects, to push the current
+    // GUI values. Mirrors the captured order; ends with the device idle (RUN=0).
+    std::vector<uint8_t> buildHyusInitBatch(const sonocontrol::Config& c) const {
+        using namespace sonocontrol::hyus;
+        std::vector<uint8_t> b;
+        const auto init = make_init();
+        b.insert(b.end(), init.begin(), init.end());
+        append_param(b, Cmd::Cfreq, encode_cfreq(c.cfreq_hz));
+        append_param(b, Cmd::Amplitude, encode_amplitude_percent(c.amplitude * 100.0));
+        append_param(b, Cmd::PulseLen, encode_pulse_len_us(c.hyus_pulse_len_us));
+        append_param(b, Cmd::PulsePeriod, encode_pulse_period_us(c.hyus_pulse_period_us));
+        append_param(b, Cmd::SeqLen, encode_seq_len_ms(c.hyus_seq_len_ms));
+        append_param(b, Cmd::SeqPeriod, encode_seq_period_ms(c.hyus_seq_period_ms));
+        append_param(b, Cmd::TotalDuration, encode_total_duration_s(c.total_duration_mins * 60.0));
+        append_param(b, Cmd::Run, 0u);
+        append_param(b, Cmd::RunMode, (c.hyus_run_mode == 1) ? 1u : 0u);
+        append_param(b, Cmd::Run, 0u);
+        append_param(b, Cmd::Run, 0u);
+        append_param(b, Cmd::TriggerSource, 0u);   // internal
+        append_param(b, Cmd::Run, 0u);
+        return b;
+    }
+
+    // The "Start" message — the short start sequence, NOT the init batch.
+    // Internal repeat (matches the Length=170 / 104-byte frame in the captures):
+    //   RUN=0, RUN=0, TRIGSRC=0, RUN=1
+    // Internal total-duration: RUN=0, TRIGSRC=0, RUN=1 (run mode + total duration
+    // were already pushed as live edits).
+    std::vector<uint8_t> buildHyusStartSeq(const sonocontrol::Config& c) const {
+        using namespace sonocontrol::hyus;
+        std::vector<uint8_t> b;
+        append_param(b, Cmd::Run, 0u);
+        if (c.hyus_run_mode == 0) append_param(b, Cmd::Run, 0u);  // repeat mode clears twice
+        append_param(b, Cmd::TriggerSource, 0u);                  // internal
+        append_param(b, Cmd::Run, 1u);                            // run enable
+        return b;
+    }
+
+    // Safety stop: tell every connected device to stop output. Sent when the
+    // app is closing so a run cannot continue unattended after the controller
+    // exits (the device otherwise keeps emitting after RUN=1 until told to stop).
+    void sendHyusSafetyStop() {
+        if (deviceKind_ != sonocontrol::DeviceKind::Hyus || !hyusDiscovery_) return;
+        const auto stop = sonocontrol::hyus::write_param(sonocontrol::hyus::Cmd::Run, 0u);
+        for (const auto& ip : hyusDiscovery_->devices())
+            hyusDiscovery_->send(ip, stop.data(), stop.size());
+    }
+
+    void sendHyusInit(const QString& ip) {
+        if (!hyusDiscovery_ || ip.isEmpty()) return;
+        config_ = buildConfig();
+        const auto batch = buildHyusInitBatch(config_);
+        hyusDiscovery_->send(ip.toStdString(), batch.data(), batch.size());
+        appendConsole("Hyus: pushed initial parameters to " + ip + " (" +
+                      QString::number(batch.size()) + " bytes).");
+    }
+
+    void onStartHyus() {
+        const QString ip = selectedHyusDevice();
+        if (ip.isEmpty() || !hyusDiscovery_) {
+            QMessageBox::warning(this, "No device",
+                "No Hyus device detected. Check the RJ45 cable and the PC network adapter "
+                "(192.168.0.x), then press Scan.");
+            return;
+        }
+        config_ = buildConfig();
+        attachActiveConfigProvenance(config_);
+        validate_config(config_);
+        if (!preflightCheckHyus(config_)) return;
+        const auto seq = buildHyusStartSeq(config_);
+        if (!hyusDiscovery_->send(ip.toStdString(), seq.data(), seq.size())) {
+            QMessageBox::critical(this, "Send failed",
+                "Could not send to " + ip + ". The device may have disconnected.");
+            return;
+        }
+        running_ = true;
+        btnStart_->setEnabled(false);
+        btnStop_->setEnabled(true);
+        btnStop_->setText(" ■  STOP ");
+        appendConsole("=== Hyus run started on " + ip + " ===");
+        appendConsole("Sent start sequence (" + QString::number(seq.size()) + " bytes: clear + internal trigger + run).");
+        statusBar()->showMessage("Hyus running on " + ip);
+        lblCycle_->setText("RUNNING");
+        startWall_.start();
+        targetHoldMode_ = (config_.length_mode == sonocontrol::LengthMode::HoldAfterTarget);
+        targetHoldStarted_ = false;
+        targetHoldStartWallS_ = 0.0;
+        targetHoldTotalS_ = std::max(0.0, config_.hold_after_target_mins * 60.0);
+        plannedTotalS_ = (config_.length_mode == sonocontrol::LengthMode::TotalDuration)
+            ? config_.total_duration_mins * 60.0
+            : ((config_.length_mode == sonocontrol::LengthMode::RepeatingCycles)
+                ? static_cast<double>(config_.repeating) * (config_.hyus_seq_period_ms / 1000.0)
+                : targetHoldTotalS_);
+        refreshSessionTimerUi();
+        sessionUiTimer_.start();
+        tempPlot_->clear();
+        tempPlot_->setLines(spnSetpoint_ ? spnSetpoint_->value() : 0.0, spnCutoff_ ? spnCutoff_->value() : 0.0);
+
+        // Launch the active control loop only when there is something to control:
+        // temperature monitoring/cutoff, PID, or cycling. Otherwise the device
+        // self-clocks and a simple timer handles total-duration auto-stop.
+        const bool needControl = config_.temperature_enabled || config_.pid_enabled || config_.use_cycling;
+        if (needControl) {
+            launchHyusWorker(config_, ip);
+        } else if (config_.length_mode == sonocontrol::LengthMode::TotalDuration && plannedTotalS_ > 0.0) {
+            hyusStopTimer_.start(static_cast<int>(plannedTotalS_ * 1000.0));
+        }
+    }
+
+    // Create + start the Hyus control-loop worker on its own thread. Shared by
+    // single runs and sequence items.
+    void launchHyusWorker(const sonocontrol::Config& cfg, const QString& ip) {
+        if (probe_) probe_->setPaused(true);  // the worker owns the HH806AU while running
+        hyusWorkerThread_ = new QThread(this);
+        hyusWorker_ = new HyusRunWorker(cfg, ip.toStdString(), hyusDiscovery_.get());
+        hyusWorker_->moveToThread(hyusWorkerThread_);
+        connect(hyusWorkerThread_, &QThread::started, hyusWorker_, &HyusRunWorker::run);
+        connect(hyusWorker_, &HyusRunWorker::console, this, &SonoControlWindow::appendConsole);
+        connect(hyusWorker_, &HyusRunWorker::temperature, this, &SonoControlWindow::onTemperature);
+        connect(hyusWorker_, &HyusRunWorker::timeUpdate, this, &SonoControlWindow::onTimeUpdate);
+        connect(hyusWorker_, &HyusRunWorker::cycle, this, &SonoControlWindow::onCycle);
+        connect(hyusWorker_, &HyusRunWorker::cutoff, this, &SonoControlWindow::onCutoff);
+        connect(hyusWorker_, &HyusRunWorker::finished, this, &SonoControlWindow::onHyusWorkerFinished);
+        connect(hyusWorker_, &HyusRunWorker::finished, hyusWorkerThread_, &QThread::quit);
+        connect(hyusWorkerThread_, &QThread::finished, hyusWorker_, &QObject::deleteLater);
+        connect(hyusWorkerThread_, &QThread::finished, hyusWorkerThread_, &QObject::deleteLater);
+        hyusWorkerThread_->start();
+    }
+
+    // Run one sequence item on the Hyus device: push that config's parameters,
+    // start, and always run the worker (so it finishes deterministically and
+    // sends RUN=0 at the end). The inter-config interval is handled by the shared
+    // sequence machinery via onHyusWorkerFinished -> handleSequenceItemFinished.
+    void launchHyusSequenceItem(const sonocontrol::Config& cfg) {
+        const QString ip = selectedHyusDevice();
+        if (ip.isEmpty() || !hyusDiscovery_) {
+            appendConsole("[Sequence] No Hyus device connected; aborting sequence.");
+            finalizeSequence(/*ok=*/false);
+            return;
+        }
+        config_ = cfg;
+        validate_config(config_);
+        const auto initBatch = buildHyusInitBatch(config_);
+        hyusDiscovery_->send(ip.toStdString(), initBatch.data(), initBatch.size());
+        const auto seq = buildHyusStartSeq(config_);
+        hyusDiscovery_->send(ip.toStdString(), seq.data(), seq.size());
+        running_ = true;
+        targetHoldMode_ = (config_.length_mode == sonocontrol::LengthMode::HoldAfterTarget);
+        targetHoldStarted_ = false;
+        targetHoldStartWallS_ = 0.0;
+        targetHoldTotalS_ = std::max(0.0, config_.hold_after_target_mins * 60.0);
+        plannedTotalS_ = (config_.length_mode == sonocontrol::LengthMode::TotalDuration)
+            ? config_.total_duration_mins * 60.0
+            : ((config_.length_mode == sonocontrol::LengthMode::RepeatingCycles)
+                ? static_cast<double>(config_.repeating) * (config_.hyus_seq_period_ms / 1000.0)
+                : targetHoldTotalS_);
+        startWall_.start();
+        refreshSessionTimerUi();
+        sessionUiTimer_.start();
+        tempPlot_->clear();
+        tempPlot_->setLines(config_.pid_setpoint, config_.cutoff_temp);
+        lblCycle_->setText("RUNNING");
+        appendConsole(QString("=== [Sequence %1/%2] Hyus run started on %3 ===")
+                          .arg(sequenceIndex_ + 1).arg(sequenceTotal_).arg(ip));
+        launchHyusWorker(config_, ip);  // always (finishes -> RUN=0 -> next after interval)
+    }
+
+    void onStopHyus() {
+        // Manual-stop PIN gate (restored for Hyus): the operator must confirm
+        // the PIN configured at preflight before the run can be stopped by hand.
+        if (pendingPinEnabled_ && !promptForStopPin()) {
+            appendConsole(">>> Manual stop cancelled (PIN not confirmed)");
+            statusBar()->showMessage("Manual stop cancelled");
+            return;
+        }
+        hyusStopTimer_.stop();
+        if (hyusWorker_) {
+            // The worker sends RUN=0 then emits finished → onHyusWorkerFinished
+            // resets the UI. Don't double-send here.
+            hyusWorker_->requestStop();
+            appendConsole("Hyus STOP requested.");
+            return;
+        }
+        const QString ip = selectedHyusDevice();
+        if (!ip.isEmpty() && hyusDiscovery_) {
+            const auto stop = sonocontrol::hyus::write_param(sonocontrol::hyus::Cmd::Run, 0u);
+            hyusDiscovery_->send(ip.toStdString(), stop.data(), stop.size());
+            appendConsole("Hyus STOP sent to " + ip + ".");
+        }
+        finishHyusRunUi("IDLE");
+    }
+
+    // No-monitoring total-duration auto-stop (simple timer path).
+    void onHyusRunFinished() {
+        const QString ip = selectedHyusDevice();
+        if (!ip.isEmpty() && hyusDiscovery_) {
+            const auto stop = sonocontrol::hyus::write_param(sonocontrol::hyus::Cmd::Run, 0u);
+            hyusDiscovery_->send(ip.toStdString(), stop.data(), stop.size());
+        }
+        appendConsole("=== Hyus run complete ===");
+        finishHyusRunUi("DONE");
+    }
+
+    // Control-loop worker finished (normal end, user stop, or cutoff).
+    void onHyusWorkerFinished(int code) {
+        hyusWorker_ = nullptr;        // deleteLater'd via thread finished
+        hyusWorkerThread_ = nullptr;
+        if (probe_ && !shutdownInProgress_) probe_->setPaused(false);  // resume temp-pill probing
+        if (sequenceActive_) {
+            // The worker already transmitted RUN=0; the sequence machinery waits
+            // the configured interval, then launches the next configuration.
+            running_ = false;
+            sessionUiTimer_.stop();
+            const int oneBased = sequenceIndex_ + 1;
+            const QString verb = (code == 2) ? "stopped by safety cutoff"
+                               : (code == 3) ? "stopped" : "complete";
+            appendConsole(QString("=== [Sequence %1/%2] Hyus run %3 ===").arg(oneBased).arg(sequenceTotal_).arg(verb));
+            lblCycle_->setText(code == 2 ? "CUTOFF" : (code == 3 ? "STOPPED" : "COMPLETE"));
+            handleSequenceItemFinished(code);
+            return;
+        }
+        if (code == 2) {              // cutoff — onCutoff already fired the dialog
+            finishHyusRunUi("CUTOFF");
+        } else {
+            appendConsole(code == 3 ? "=== Hyus run stopped ===" : "=== Hyus run complete ===");
+            finishHyusRunUi(code == 3 ? "STOPPED" : "DONE");
+        }
+    }
+
+    // Edit -> Switch Device. Closes the current session and asks main() to
+    // re-show the device-selection window (the program effectively returns to
+    // the device picker). Refused while a run/sequence is active.
+    static QString deviceDisplayName(sonocontrol::DeviceKind k) {
+        return k == sonocontrol::DeviceKind::Hyus ? QStringLiteral("Hyus (LAN)")
+                                                  : QStringLiteral("Zhuhai (COM+UDP)");
+    }
+
+    void onSwitchDevice() {
+        if (running_ || sequenceActive_) {
+            QMessageBox::warning(this, "Switch Device", "Stop the current run before switching devices.");
+            return;
+        }
+        const auto choice = QMessageBox::question(this, "Switch Device",
+            "Switch to a different device?\n\nThe current session will close and the device "
+            "selection window will appear.",
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (choice != QMessageBox::Yes) return;
+        g_switchDeviceRequested = true;
+        close();  // closeEvent tears down discovery/connection; main() loops
+    }
+
+    void finishHyusRunUi(const QString& phase) {
+        running_ = false;
+        sessionUiTimer_.stop();
+        btnStart_->setEnabled(true);
+        btnStop_->setEnabled(false);
+        btnStop_->setText(" ■  EMERGENCY STOP ");
+        lblCycle_->setText(phase);
+        statusBar()->showMessage("Ready");
+        // Drop the manual-stop PIN so it does not leak across runs.
+        pendingPinEnabled_ = false;
+        pendingPinUsername_.clear();
+        pendingPin_.clear();
     }
 
     void updateLengthModeUi() {
@@ -1855,6 +2706,7 @@ private slots:
             }
         }
         updateTemperatureSensorUi();
+        updateSequencePreview();
     }
 
     void onPidChanged(bool enabled) {
@@ -1864,6 +2716,21 @@ private slots:
             chkTempMonitor_->setChecked(true);
         }
         updateLengthModeUi();
+        updateCoolingModeUi();
+    }
+
+    // "Hold at temperature (PID)" cooling needs PID feedback. Disable it (and
+    // revert to "Stop ultrasound") whenever PID is off. Applies to both devices.
+    void updateCoolingModeUi() {
+        const bool pid = chkPid_ && chkPid_->isChecked();
+        if (!rbCoolLow_) return;
+        rbCoolLow_->setEnabled(pid);
+        rbCoolLow_->setToolTip(pid ? QString()
+            : "Hold-at-temperature cooling requires PID temperature control to be enabled.");
+        if (!pid && rbCoolLow_->isChecked() && rbCoolStop_) {
+            QSignalBlocker b(rbCoolStop_);
+            rbCoolStop_->setChecked(true);
+        }
     }
 
     void onTempMonitoringChanged(bool) {
@@ -2089,6 +2956,7 @@ private slots:
             "Kd  Derivative gain. Suppresses rapid rises; too much makes output noisy.\n"
             "Thermal const (tau)  Liquid time constant for the predictive model T_future = T + τ·dT/dt·(1 − e^(−t/τ)). Larger τ brakes earlier; τ = 0 disables prediction.\n"
             "Prediction horizon  Lookahead in seconds. 0 = use the current hardware interval.\n"
+            "Temp smoothing window  Span (seconds) of the least-squares fit that estimates dT/dt from the noisy probe. Larger = smoother but slower-reacting slope; default 30 s, range 5–600 s.\n"
             "\n"
             "Experiment length modes\n"
             "───────────────────────\n"
@@ -2251,6 +3119,7 @@ private slots:
         setStyleSheet(styleSheetText());
         if (tempPlot_) tempPlot_->update();
         if (waveformPlot_) waveformPlot_->update();
+        if (seqPlot_) seqPlot_->update();
         if (chkAutoTheme_) chkAutoTheme_->blockSignals(true);
         if (chkDarkMode_)  chkDarkMode_->blockSignals(true);
         if (chkDarkMode_)  chkDarkMode_->setChecked(dark);
@@ -2341,6 +3210,10 @@ QLabel {
     color: %5;
     background: transparent;
     font-size: 13px;
+}
+
+QWidget#targetHoldPanel {
+    background: transparent;
 }
 
 QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox {
@@ -2550,6 +3423,9 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         edit->addSeparator();
         auto* actSequence = edit->addAction("Sequence...");
         connect(actSequence, &QAction::triggered, this, &SonoControlWindow::openSequenceDialog);
+        edit->addSeparator();
+        auto* actSwitchDevice = edit->addAction("Switch Device...");
+        connect(actSwitchDevice, &QAction::triggered, this, &SonoControlWindow::onSwitchDevice);
 
         auto* about = menuBar()->addMenu("About");
         auto* actReadme = about->addAction("Readme");
@@ -2596,23 +3472,32 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
             chkSimTemp_ = new QCheckBox("Sim Temp"); chkSimUs_ = new QCheckBox("Sim US"); chkSimTemp_->setChecked(true); chkSimUs_->setChecked(true);
             l->addWidget(chkSimTemp_); l->addWidget(chkSimUs_);
         }
-        // Status pills — compact background-colored labels for at-a-glance state
+        // Status pills — compact background-colored labels for at-a-glance state.
+        // The FPGA device shows COM3/UDP/Temp; the Hyus device shows a single LAN
+        // pill (green once a device is detected on the local network).
+        const bool hyus = (deviceKind_ == sonocontrol::DeviceKind::Hyus);
         lblCom3Status_ = new QLabel("COM3");
         lblUsStatus_ = new QLabel("UDP");
         lblTempStatus_ = new QLabel("Temp");
-        for (auto* x : {lblCom3Status_, lblUsStatus_, lblTempStatus_}) {
+        lblLanStatus_ = new QLabel("LAN");
+        for (auto* x : {lblCom3Status_, lblUsStatus_, lblTempStatus_, lblLanStatus_}) {
             x->setStyleSheet(statusStyle("#b54708"));
             x->setMinimumHeight(22);
             x->setMaximumHeight(24);
             l->addWidget(x);
             l->addSpacing(4);
         }
+        lblCom3Status_->setVisible(!hyus);
+        lblUsStatus_->setVisible(!hyus);
+        lblTempStatus_->setVisible(true);   // temperature monitoring applies to both devices
+        lblLanStatus_->setVisible(hyus);
         btnStart_ = new QPushButton(" ▶  START "); btnStart_->setObjectName("start"); btnStart_->setMinimumWidth(120); btnStart_->setCursor(Qt::PointingHandCursor); connect(btnStart_, &QPushButton::clicked, this, &SonoControlWindow::onStart);
         btnStop_ = new QPushButton(" ■  EMERGENCY STOP "); btnStop_->setObjectName("stop"); btnStop_->setMinimumWidth(170); btnStop_->setEnabled(false); btnStop_->setCursor(Qt::PointingHandCursor);
         // Dispatch click depending on which phase we're in: first click sends
         // a graceful request_stop; if the worker doesn't exit in 2 s, the
         // button is re-labelled "FORCE STOP" and the next click cancels I/O.
         connect(btnStop_, &QPushButton::clicked, this, [this]() {
+            if (deviceKind_ == sonocontrol::DeviceKind::Hyus) { onStopHyus(); return; }
             if (btnStop_->text().contains("FORCE", Qt::CaseInsensitive)) onForceStop();
             else onStop();
         });
@@ -2621,11 +3506,20 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         return h;
     }
 
+    // Per-device UI policy. All tabs are available for both devices now; the
+    // per-device differences are handled inside the individual tab builders
+    // (PARAMS/PID/CONNECT swap their groups by device).
+    void applyDeviceUiPolicy() {
+        if (!tabs_) return;
+    }
+
     QWidget* buildLeftPanel() {
         auto* scroll = new QScrollArea; scroll->setWidgetResizable(true); scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
         auto* cont = new QWidget; cont->setMaximumWidth(410);
         auto* v = new QVBoxLayout(cont); v->setContentsMargins(0,0,0,0); v->setSpacing(12);
         auto* tabs = new QTabWidget; tabs->addTab(buildParamsTab(), "PARAMS"); tabs->addTab(buildPidTab(), "PID"); tabs->addTab(buildCycleTab(), "CYCLE"); tabs->addTab(buildConnTab(), "CONNECT");
+        tabs_ = tabs;
+        applyDeviceUiPolicy();
         v->addWidget(tabs);
         lblConfigStatus_ = new QLabel("Config: GUI defaults");
         lblConfigStatus_->setWordWrap(true);
@@ -2635,18 +3529,37 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
     }
 
     QWidget* buildParamsTab() {
+        const bool hyus = (deviceKind_ == sonocontrol::DeviceKind::Hyus);
         auto* w = new QWidget; auto* v = new QVBoxLayout(w); v->setSpacing(12); v->setContentsMargins(12,14,12,14);
+
+        // --- Ultrasound (FPGA): amplitude / carrier freq / PRF / duty / waveform ---
         auto* us = new QGroupBox("Ultrasound"); auto* g = new QGridLayout(us);
         spnAmp_ = dspin(0.0,1.0,0.5,3,0.01); spnCfreq_ = dspin(1.0,10000.0,500.0,1,10.0); spnPrf_ = dspin(1.0,100000.0,1000.0,0,100.0); spnDuty_ = dspin(0.0,100.0,50.0,2,0.1);
         cmbWave_ = new QComboBox; cmbWave_->addItems({"Sine","Square","Triangle"});
         addRow(g,0,"Amplitude",spnAmp_,"(0–1)"); addRow(g,1,"CFreq",spnCfreq_,"kHz"); addRow(g,2,"PRF",spnPrf_,"Hz"); addRow(g,3,"Duty Cycle",spnDuty_,"%"); addRow(g,4,"Waveform",cmbWave_,""); v->addWidget(us);
+        // --- Ultrasound (Hyus): pulse frequency + pulse amplitude only ---
+        auto* usH = new QGroupBox("Ultrasound"); auto* gH = new QGridLayout(usH);
+        spnHyusFreqMhz_ = dspin(0.0, 1.0, 1.0, 3, 0.03125); spnHyusAmpPct_ = dspin(0.0, 100.0, 50.0, 1, 1.0);
+        addRow(gH,0,"Pulse Frequency",spnHyusFreqMhz_,"MHz"); addRow(gH,1,"Pulse Amplitude",spnHyusAmpPct_,"%"); v->addWidget(usH);
+
+        // --- Timing (FPGA): duration / interval / sample rate ---
         auto* timing = new QGroupBox("Timing"); auto* gt = new QGridLayout(timing);
         // Interval lower bound is sonocontrol::kMinIntervalTimeS (see the
         // header for rationale: serial CFREQ/PRF/DUR with the hardware
         // 100 ms COM gap each + 4096 UDP datagrams). Preflight raises an
         // extra soft warning at <0.5 s.
         spnDuration_ = dspin(10.0,60000.0,1000.0,0,100.0); spnInterval_ = dspin(sonocontrol::kMinIntervalTimeS,3600.0,5.0,2,0.5); spnSampleRate_ = dspin(0.1,20.0,2.0,1,0.5);
-        addRow(gt,0,"Duration",spnDuration_,"ms"); addRow(gt,1,"Interval",spnInterval_,"s"); addRow(gt,2,"Sample Rate",spnSampleRate_,"Hz"); v->addWidget(timing);
+        // spnSampleRate_ is shared; it is added to whichever Timing group is
+        // shown so temperature sampling rate is editable for both devices.
+        addRow(gt,0,"Duration",spnDuration_,"ms"); addRow(gt,1,"Interval",spnInterval_,"s"); if (!hyus) addRow(gt,2,"Sample Rate",spnSampleRate_,"Hz"); v->addWidget(timing);
+        // --- Timing (Hyus): pulse length/period + sequence length/period ---
+        auto* timingH = new QGroupBox("Timing"); auto* gtH = new QGridLayout(timingH);
+        spnHyusPulseLenUs_ = dspin(0.1, 1000000.0, 160.0, 1, 10.0);
+        spnHyusPulsePeriodUs_ = dspin(0.1, 1000000.0, 400.0, 1, 10.0);
+        spnHyusSeqLenMs_ = dspin(0.001, 1000000.0, 1.0, 3, 1.0);
+        spnHyusSeqPeriodMs_ = dspin(0.001, 1000000.0, 1000.0, 3, 100.0);
+        addRow(gtH,0,"Pulse Length",spnHyusPulseLenUs_,"us"); addRow(gtH,1,"Pulse Period",spnHyusPulsePeriodUs_,"us"); addRow(gtH,2,"Sequence Length",spnHyusSeqLenMs_,"ms"); addRow(gtH,3,"Sequence Period",spnHyusSeqPeriodMs_,"ms"); if (hyus) addRow(gtH,4,"Sample Rate",spnSampleRate_,"Hz"); v->addWidget(timingH);
+
         auto* total = new QGroupBox("Experiment Length"); auto* tv = new QVBoxLayout(total);
         rbTotalDur_ = new QRadioButton("Total Duration (mins)");
         rbRepeating_ = new QRadioButton("Repeating (cycles)");
@@ -2659,10 +3572,18 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         spnTargetTol_ = dspin(0.05,5.0,0.3,2,0.05);
         auto* row1 = new QHBoxLayout; row1->addWidget(rbTotalDur_); row1->addWidget(spnTotalDur_); row1->addWidget(new QLabel("min"));
         auto* row2 = new QHBoxLayout; row2->addWidget(rbRepeating_); row2->addWidget(spnRepeating_); row2->addWidget(new QLabel("×"));
+        // Target-hold is temperature-based and applies to both devices because
+        // both share the HH806AU temperature path.
+        auto* targetHold = new QWidget;
+        targetHold->setObjectName("targetHoldPanel");
+        auto* thv = new QVBoxLayout(targetHold); thv->setContentsMargins(0,0,0,0);
         auto* row3 = new QHBoxLayout; row3->addWidget(rbTargetHold_); row3->addWidget(spnTargetHoldMin_); row3->addWidget(new QLabel("min"));
         auto* row4 = new QHBoxLayout; row4->addSpacing(26); row4->addWidget(new QLabel("Target tolerance ±")); row4->addWidget(spnTargetTol_); row4->addWidget(new QLabel(QString::fromUtf8("°C")));
-        tv->addLayout(row1); tv->addLayout(row2); tv->addLayout(row3); tv->addLayout(row4);
-        auto* note = new QLabel("PID mode allows Total Duration or After-target Hold only. Cycle mode is available only with Total Duration.");
+        thv->addLayout(row3); thv->addLayout(row4);
+        tv->addLayout(row1); tv->addLayout(row2); tv->addWidget(targetHold);
+        auto* note = new QLabel(hyus
+            ? "Total duration = Repeating × Sequence period. After-target Hold uses the shared HH806AU temperature feedback."
+            : "PID mode allows Total Duration or After-target Hold only. Cycle mode is available only with Total Duration.");
         note->setWordWrap(true); note->setStyleSheet("color:#667085; font-size:12px;");
         tv->addWidget(note);
         v->addWidget(total);
@@ -2672,6 +3593,7 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         connect(spnTotalDur_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, &SonoControlWindow::updateRepeatingFromDuration);
         connect(spnInterval_, qOverload<double>(&QDoubleSpinBox::valueChanged), this, &SonoControlWindow::updateRepeatingFromDuration);
         connect(spnRepeating_, qOverload<int>(&QSpinBox::valueChanged), this, &SonoControlWindow::updateDurationFromRepeating);
+
         grpSafety_ = new QGroupBox("Safety");
         auto* safetyV = new QVBoxLayout(grpSafety_);
         auto* sh = new QHBoxLayout;
@@ -2684,14 +3606,68 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         chkTempRequired_ = new QCheckBox("Abort run if temperature sensor stops responding (fail-closed)");
         chkTempRequired_->setToolTip("When enabled, three consecutive invalid temperature samples will stop ultrasound and abort the run. PID and after-target-hold runs always fail closed regardless of this flag.");
         safetyV->addWidget(chkTempRequired_);
-        v->addWidget(grpSafety_); v->addStretch(); return w;
+        v->addWidget(grpSafety_); v->addStretch();
+
+        // Per-device visibility. Widgets for the other device stay created (so
+        // buildConfig/applyConfigToUi remain null-safe) but hidden.
+        us->setVisible(!hyus); timing->setVisible(!hyus);
+        usH->setVisible(hyus); timingH->setVisible(hyus);
+        // Safety cutoff applies to both devices (temperature monitoring is shared).
+        grpSafety_->setVisible(true);
+        targetHold->setVisible(true);
+        if (hyus) {
+            using sonocontrol::hyus::Cmd;
+            namespace hp = sonocontrol::hyus;
+            auto vc = qOverload<double>(&QDoubleSpinBox::valueChanged);
+            enforceHyusTiming();  // establish initial dependent ranges
+            // Each edit clamps timing to the constraints, refreshes the schematic,
+            // and is sent to the device immediately (whether or not running).
+            connect(spnHyusFreqMhz_, vc, this, [this](double v){ updateSequencePreview(); sendHyusParam(Cmd::Cfreq, hp::encode_cfreq(v * 1.0e6)); });
+            connect(spnHyusAmpPct_, vc, this, [this](double v){ updateSequencePreview(); sendHyusParam(Cmd::Amplitude, hp::encode_amplitude_percent(v)); });
+            connect(spnHyusPulseLenUs_, vc, this, [this](double){ enforceHyusTiming(); sendHyusParam(Cmd::PulseLen, hp::encode_pulse_len_us(spnHyusPulseLenUs_->value())); updateSequencePreview(); });
+            connect(spnHyusPulsePeriodUs_, vc, this, [this](double){ enforceHyusTiming(); sendHyusParam(Cmd::PulsePeriod, hp::encode_pulse_period_us(spnHyusPulsePeriodUs_->value())); updateSequencePreview(); });
+            connect(spnHyusSeqLenMs_, vc, this, [this](double){ enforceHyusTiming(); sendHyusParam(Cmd::SeqLen, hp::encode_seq_len_ms(spnHyusSeqLenMs_->value())); updateSequencePreview(); });
+            connect(spnHyusSeqPeriodMs_, vc, this, [this](double){ enforceHyusTiming(); sendHyusParam(Cmd::SeqPeriod, hp::encode_seq_period_ms(spnHyusSeqPeriodMs_->value())); updateRepeatingFromDuration(); });
+            // Experiment-length edits also map to live frames (run mode + total duration).
+            connect(spnTotalDur_, vc, this, [this](double v){ if (rbTotalDur_ && rbTotalDur_->isChecked()) sendHyusParam(Cmd::TotalDuration, hp::encode_total_duration_s(v * 60.0)); });
+            connect(rbTotalDur_, &QRadioButton::toggled, this, [this](bool on){ if (on) { sendHyusParam(Cmd::RunMode, 1u); sendHyusParam(Cmd::TotalDuration, hp::encode_total_duration_s(spnTotalDur_->value() * 60.0)); } });
+            connect(rbRepeating_, &QRadioButton::toggled, this, [this](bool on){ if (on) sendHyusParam(Cmd::RunMode, 0u); });
+            connect(rbTargetHold_, &QRadioButton::toggled, this, [this](bool on){ if (on) sendHyusParam(Cmd::RunMode, 0u); });
+        } else {
+            auto vc = qOverload<double>(&QDoubleSpinBox::valueChanged);
+            enforceZhuhaiTiming();  // establish initial Duration/Interval ranges
+            // Keep the schematic preview live as the user edits the FPGA params.
+            connect(spnAmp_, vc, this, [this](double){ updateSequencePreview(); });
+            connect(spnPrf_, vc, this, [this](double){ updateSequencePreview(); });
+            connect(spnDuty_, vc, this, [this](double){ updateSequencePreview(); });
+            connect(spnDuration_, vc, this, [this](double){ enforceZhuhaiTiming(); updateSequencePreview(); });
+            connect(spnInterval_, vc, this, [this](double){ enforceZhuhaiTiming(); updateSequencePreview(); });
+        }
+        return w;
     }
 
     QWidget* buildPidTab() {
         auto* w = new QWidget; auto* v = new QVBoxLayout(w); v->setSpacing(12); v->setContentsMargins(12,14,12,14);
         auto* en = new QGroupBox("PID Enable"); auto* ev = new QVBoxLayout(en); chkPid_ = new QCheckBox("Enable PID Temperature Control"); ev->addWidget(chkPid_); connect(chkPid_, &QCheckBox::toggled, this, [this](bool v){ idleSensor_.reset(); onPidChanged(v); }); v->addWidget(en);
         auto* sp = new QGroupBox("Setpoint"); auto* sph = new QHBoxLayout(sp); spnSetpoint_ = dspin(20.0,50.0,40.0,1,0.5); sph->addWidget(new QLabel("Target Temp")); sph->addWidget(spnSetpoint_); sph->addWidget(new QLabel(QString::fromUtf8("°C"))); v->addWidget(sp);
+        const bool hyus = (deviceKind_ == sonocontrol::DeviceKind::Hyus);
+        // FPGA: multi-select controlled parameters.
         auto* sel = new QGroupBox("Controlled Parameters"); auto* sv = new QVBoxLayout(sel); chkPidAmp_ = new QCheckBox("Amplitude"); chkPidDuration_ = new QCheckBox("Duration"); chkPidInterval_ = new QCheckBox("Interval Time"); chkPidDuty_ = new QCheckBox("Duty Cycle"); chkPidAmp_->setChecked(true); for (auto* c : {chkPidAmp_, chkPidDuration_, chkPidInterval_, chkPidDuty_}) sv->addWidget(c); sv->addWidget(new QLabel("Interval ≥ Duration enforced")); v->addWidget(sel);
+        // Hyus: single-select controlled variable. PID drives the chosen knob
+        // live (no run interruption); the configured value is the upper limit.
+        auto* selH = new QGroupBox("Controlled Variable (single)"); auto* svH = new QVBoxLayout(selH);
+        rbHyusPidAmp_ = new QRadioButton("Pulse amplitude (% of set value)");
+        rbHyusPidPulse_ = new QRadioButton("Pulse length / period (fixed period, adjust length)");
+        rbHyusPidSeq_ = new QRadioButton("Sequence length / period (fixed period, adjust length)");
+        rbHyusPidPulse_->setChecked(true);  // default
+        auto* bgPid = new QButtonGroup(this); bgPid->addButton(rbHyusPidAmp_); bgPid->addButton(rbHyusPidPulse_); bgPid->addButton(rbHyusPidSeq_);
+        for (auto* r : {rbHyusPidAmp_, rbHyusPidPulse_, rbHyusPidSeq_}) svH->addWidget(r);
+        auto* pidNoteH = new QLabel("PID adjusts only the selected variable, sending modification commands during the run without pausing it.");
+        pidNoteH->setWordWrap(true); pidNoteH->setStyleSheet("color:#667085; font-size:12px;");
+        svH->addWidget(pidNoteH);
+        v->addWidget(selH);
+        sel->setVisible(!hyus);
+        selH->setVisible(hyus);
         auto* gains = new QGroupBox("PID Gains");
         auto* gg = new QGridLayout(gains);
         spnKp_ = dspin(0.0,10.0,0.8,3,0.05);
@@ -2699,18 +3675,20 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         spnKd_ = dspin(0.0,5.0,0.2,3,0.05);
         spnTau_ = dspin(0.0,3600.0,25.0,1,1.0);
         spnHorizon_ = dspin(0.0,300.0,0.0,1,1.0);
+        spnRateWindow_ = dspin(5.0,600.0,30.0,0,5.0);
         addRow(gg,0,"Kp",spnKp_,"");
         addRow(gg,1,"Ki",spnKi_,"");
         addRow(gg,2,"Kd",spnKd_,"");
         addRow(gg,3,"Thermal const",spnTau_,"s");
         addRow(gg,4,"Prediction horizon",spnHorizon_,"s");
-        auto* tauNote = new QLabel("Model: T_future = T + thermal_const × dT/dt × (1 - exp(-horizon/thermal_const)). Set thermal_const=0 to disable prediction. Set horizon=0 to use the current hardware interval.");
+        addRow(gg,5,"Temp smoothing window",spnRateWindow_,"s");
+        auto* tauNote = new QLabel("Model: T_future = T + thermal_const × dT/dt × (1 - exp(-horizon/thermal_const)). Set thermal_const=0 to disable prediction. Set horizon=0 to use the current hardware interval. The temp smoothing window is the span of the least-squares fit used to estimate dT/dt (larger = smoother but slower-reacting slope).");
         tauNote->setWordWrap(true);
         tauNote->setStyleSheet("color:#667085; font-size:12px;");
-        gg->addWidget(tauNote,5,0,1,3);
+        gg->addWidget(tauNote,6,0,1,3);
         v->addWidget(gains);
 
-        pidWidgets_ = {sp, sel, gains}; v->addStretch(); return w;
+        pidWidgets_ = {sp, sel, selH, gains}; v->addStretch(); return w;
     }
 
     QWidget* buildCycleTab() {
@@ -2743,8 +3721,38 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 
     QWidget* buildConnTab() {
         auto* w = new QWidget; auto* v = new QVBoxLayout(w); v->setSpacing(12); v->setContentsMargins(12,14,12,14);
+        const bool hyus = (deviceKind_ == sonocontrol::DeviceKind::Hyus);
         auto* scan = new QPushButton("⟳  Scan Ports"); connect(scan, &QPushButton::clicked, this, &SonoControlWindow::refreshPorts); v->addWidget(scan);
-        auto* us = new QGroupBox("Ultrasound Device"); auto* gu = new QGridLayout(us); cmbCom3_ = new QComboBox; txtUdpHost_ = new QLineEdit(sonocontrol::protocol::UDP_HOST_DEFAULT); spnUdpPort_ = ispin(1,65535,sonocontrol::protocol::UDP_PORT_DEFAULT); addRow(gu,0,"COM3 Port",cmbCom3_,""); addRow(gu,1,"UDP Host",txtUdpHost_,""); addRow(gu,2,"UDP Port",spnUdpPort_,""); v->addWidget(us);
+        scan->setVisible(!hyus);  // serial-port scan is meaningless for the LAN device
+        // SonoControl FPGA connection group (serial COM + UDP). The widgets are
+        // always created (buildConfig/applyConfigToUi reference them
+        // unconditionally); only the group's visibility is device-dependent.
+        grpUsFpga_ = new QGroupBox("Ultrasound Device (FPGA)"); auto* gu = new QGridLayout(grpUsFpga_); cmbCom3_ = new QComboBox; txtUdpHost_ = new QLineEdit(sonocontrol::protocol::UDP_HOST_DEFAULT); spnUdpPort_ = ispin(1,65535,sonocontrol::protocol::UDP_PORT_DEFAULT); addRow(gu,0,"COM3 Port",cmbCom3_,""); addRow(gu,1,"UDP Host",txtUdpHost_,""); addRow(gu,2,"UDP Port",spnUdpPort_,""); v->addWidget(grpUsFpga_);
+        // Hyus connection group (Ethernet). No IP/port entry: the device is
+        // discovered automatically over the LAN (the PC broadcasts a beacon and
+        // the device dials in) and the user simply picks it from the dropdown.
+        grpUsHyus_ = new QGroupBox("Ultrasound Device (Hyus · Ethernet)");
+        auto* gh = new QGridLayout(grpUsHyus_);
+        cmbHyusDevice_ = new QComboBox; cmbHyusDevice_->setMinimumWidth(170);
+        // Init batch is pushed when the user actively selects a device from the
+        // dropdown (not automatically on connect).
+        connect(cmbHyusDevice_, qOverload<int>(&QComboBox::activated), this, [this](int){
+            const QString ip = selectedHyusDevice();
+            if (!ip.isEmpty()) sendHyusInit(ip);
+        });
+        auto* scanHyus = new QPushButton("Scan"); scanHyus->setFixedWidth(72);
+        connect(scanHyus, &QPushButton::clicked, this, &SonoControlWindow::rescanHyusDevices);
+        lblHyusStatus_ = new QLabel("Detecting devices…");
+        lblHyusStatus_->setWordWrap(true); lblHyusStatus_->setStyleSheet("color:#667085; font-size:12px;");
+        gh->addWidget(new QLabel("Device"),0,0); gh->addWidget(cmbHyusDevice_,0,1); gh->addWidget(scanHyus,0,2);
+        gh->addWidget(lblHyusStatus_,1,0,1,3);
+        auto* hyusNote = new QLabel("Connect the device by RJ45 and set the PC wired network adapter to 192.168.0.x. "
+                                    "The device appears here automatically once it connects.");
+        hyusNote->setWordWrap(true); hyusNote->setStyleSheet("color:#667085; font-size:12px;");
+        gh->addWidget(hyusNote,2,0,1,3);
+        v->addWidget(grpUsHyus_);
+        grpUsFpga_->setVisible(!hyus);
+        grpUsHyus_->setVisible(hyus);
         grpTempSensor_ = new QGroupBox("Temperature Sensor (HH806AU)"); auto* tg = new QGridLayout(grpTempSensor_); chkTempMonitor_ = new QCheckBox("Connect / monitor temperature sensor"); connect(chkTempMonitor_, &QCheckBox::toggled, this, [this](bool v){ idleSensor_.reset(); onTempMonitoringChanged(v); }); cmbCom11_ = new QComboBox; btnTestTemp_ = new QPushButton("Test"); btnTestTemp_->setFixedWidth(72); connect(btnTestTemp_, &QPushButton::clicked, this, &SonoControlWindow::testTempConnection); cmbTempChannel_ = new QComboBox; cmbTempChannel_->addItems({"T1 only","T2 only","Average T1+T2"}); cmbTempChannel_->setCurrentIndex(0); chkTempFallback_ = new QCheckBox("Allow fallback to the other probe if selected channel is unavailable"); chkTempFallback_->setToolTip("Enable only when both T1 and T2 probes are physically installed. Fallback usage is logged."); spnTempMin_ = dspin(-20.0, 80.0, 10.0, 1, 1.0); spnTempMax_ = dspin(20.0, 150.0, 80.0, 1, 1.0); spnTempRate_ = dspin(1.0, 100.0, 15.0, 1, 1.0); lblPortInfo_ = new QLabel; lblPortInfo_->setWordWrap(true); lblTempRequirement_ = new QLabel; lblTempRequirement_->setWordWrap(true); lblTempRequirement_->setStyleSheet("color:#667085; font-size:13px;"); tg->addWidget(chkTempMonitor_,0,0,1,3); tg->addWidget(new QLabel("COM Port"),1,0); tg->addWidget(cmbCom11_,1,1); tg->addWidget(btnTestTemp_,1,2); tg->addWidget(new QLabel("Channel"),2,0); tg->addWidget(cmbTempChannel_,2,1,1,2); tg->addWidget(chkTempFallback_,3,0,1,3); tg->addWidget(new QLabel("Valid range"),4,0); auto* rangeRow = new QWidget; auto* rr = new QHBoxLayout(rangeRow); rr->setContentsMargins(0,0,0,0); rr->addWidget(spnTempMin_); rr->addWidget(new QLabel("to")); rr->addWidget(spnTempMax_); rr->addWidget(new QLabel(QString::fromUtf8("°C"))); tg->addWidget(rangeRow,4,1,1,2); tg->addWidget(new QLabel("Max rate"),5,0); auto* rateRow = new QWidget; auto* rt = new QHBoxLayout(rateRow); rt->setContentsMargins(0,0,0,0); rt->addWidget(spnTempRate_); rt->addWidget(new QLabel(QString::fromUtf8("°C/s"))); tg->addWidget(rateRow,5,1,1,2); tg->addWidget(lblTempRequirement_,6,0,1,3); tg->addWidget(lblPortInfo_,7,0,1,3); v->addWidget(grpTempSensor_);
         tempWidgets_ = {cmbCom11_, cmbTempChannel_, btnTestTemp_, chkTempFallback_, spnTempMin_, spnTempMax_, spnTempRate_};
         auto* misc = new QGroupBox("Console"); auto* mv = new QVBoxLayout(misc); chkConsole_ = new QCheckBox("Enable Console Output"); connect(chkConsole_, &QCheckBox::toggled, this, &SonoControlWindow::toggleConsole); mv->addWidget(chkConsole_); v->addWidget(misc);
@@ -2842,7 +3850,11 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
     QWidget* buildCenterPanel() {
         auto* w = new QWidget; auto* v = new QVBoxLayout(w); v->setContentsMargins(0,0,0,0); v->setSpacing(12);
         auto* temp = new QGroupBox("Temperature"); auto* tv = new QVBoxLayout(temp); tempPlot_ = new TemperaturePlot; tv->addWidget(tempPlot_); v->addWidget(temp, 2);
-        auto* wf = new QGroupBox("Waveform (current UDP burst)"); auto* wv = new QVBoxLayout(wf); waveformPlot_ = new WaveformPlot; waveformPlot_->setWaveform(sonocontrol::protocol::waveform_float_array(0.5,0.5,sonocontrol::WaveShape::Sine)); wv->addWidget(waveformPlot_); v->addWidget(wf, 1);
+        {
+            // Both devices use the pulse-sequence schematic.
+            auto* wf = new QGroupBox("Pulse Sequence"); auto* wv = new QVBoxLayout(wf);
+            seqPlot_ = new PulseSequencePlot; wv->addWidget(seqPlot_); v->addWidget(wf, 1);
+        }
         return w;
     }
 
@@ -2850,7 +3862,17 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         auto* w = new QWidget; auto* v = new QVBoxLayout(w); v->setContentsMargins(0,0,0,0); v->setSpacing(12);
         auto* timer = new QGroupBox("Session Timer"); auto* tg = new QGridLayout(timer); lblElapsed_ = statLabel("00:00:00"); lblRemaining_ = statLabel("--:--:--"); lblCycle_ = statLabel("IDLE", "#5a6070"); addStat(tg,0,"Elapsed",lblElapsed_); addStat(tg,1,"Remaining",lblRemaining_); addStat(tg,2,"Phase",lblCycle_); v->addWidget(timer);
         auto* cur = new QGroupBox("Temperature"); auto* cg = new QGridLayout(cur); lblT1_ = statLabel("--.-°C"); lblT2_ = statLabel("--.-°C"); lblTavg_ = statLabel("--.-°C"); addStat(cg,0,"T1",lblT1_); addStat(cg,1,"T2",lblT2_); addStat(cg,2,"Avg",lblTavg_); v->addWidget(cur);
-        auto* active = new QGroupBox("Active Parameters"); auto* ag = new QGridLayout(active); lblCurAmp_=statLabel("--"); lblCurCfreq_=statLabel("-- kHz"); lblCurPrf_=statLabel("-- Hz"); lblCurDuty_=statLabel("--%"); lblCurDur_=statLabel("-- ms"); lblCurIntv_=statLabel("-- s"); addStat(ag,0,"Amplitude",lblCurAmp_); addStat(ag,1,"CFreq",lblCurCfreq_); addStat(ag,2,"PRF",lblCurPrf_); addStat(ag,3,"Duty",lblCurDuty_); addStat(ag,4,"Duration",lblCurDur_); addStat(ag,5,"Interval",lblCurIntv_); v->addWidget(active); v->addStretch(); return w;
+        auto* active = new QGroupBox("Active Parameters"); auto* ag = new QGridLayout(active);
+        // The six value labels are reused for both devices; only the row titles
+        // and the values written into them differ. For Hyus they are populated
+        // by updateSequencePreview() (the FPGA runtime's onParams() does not run).
+        lblCurAmp_=statLabel("--"); lblCurCfreq_=statLabel("--"); lblCurPrf_=statLabel("--"); lblCurDuty_=statLabel("--"); lblCurDur_=statLabel("--"); lblCurIntv_=statLabel("--");
+        if (deviceKind_ == sonocontrol::DeviceKind::Hyus) {
+            addStat(ag,0,"Pulse Amp",lblCurAmp_); addStat(ag,1,"Pulse Len",lblCurCfreq_); addStat(ag,2,"Pulse Period",lblCurPrf_); addStat(ag,3,"Seq Len",lblCurDuty_); addStat(ag,4,"Seq Period",lblCurDur_); addStat(ag,5,"Repeating",lblCurIntv_);
+        } else {
+            addStat(ag,0,"Amplitude",lblCurAmp_); addStat(ag,1,"CFreq",lblCurCfreq_); addStat(ag,2,"PRF",lblCurPrf_); addStat(ag,3,"Duty",lblCurDuty_); addStat(ag,4,"Duration",lblCurDur_); addStat(ag,5,"Interval",lblCurIntv_);
+        }
+        v->addWidget(active); v->addStretch(); return w;
     }
 
     QWidget* buildConsolePanel() {
@@ -2955,11 +3977,106 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
     }
 
 
+    // HH806AU readiness check for the Hyus device. Mirrors the temperature
+    // portion of the FPGA runHardwarePreflight: hard-fail when PID needs the
+    // sensor, otherwise offer to continue without monitoring.
+    bool hyusTemperaturePreflight(sonocontrol::Config& cfg) {
+        if (!cfg.temperature_enabled || cfg.simulate_temp) return true;
+        if (cmbCom11_ && (QString::fromStdString(cfg.com11_port).trimmed().isEmpty() ||
+                          cmbCom11_->currentText().contains("no ports", Qt::CaseInsensitive))) {
+            if (cfg.pid_enabled || cfg.length_mode == sonocontrol::LengthMode::HoldAfterTarget) {
+                QMessageBox::critical(this, "Missing Temperature Port",
+                    "This mode requires temperature feedback. Select a valid HH806AU COM port.");
+                return false;
+            }
+            const auto choice = QMessageBox::warning(this, "Temperature Sensor Not Available",
+                "Temperature monitoring is enabled, but no valid HH806AU COM port is selected.\n\n"
+                "Continue without temperature monitoring and software cutoff for this run?",
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+            if (choice != QMessageBox::Yes) return false;
+            cfg.temperature_enabled = false; cfg.simulate_temp = false;
+            return true;
+        }
+        try {
+            sonocontrol::HH806AUSensor sensor(cfg.com11_port, cfg.min_plausible_temp_c,
+                                              cfg.max_plausible_temp_c, cfg.max_temp_rate_c_per_s);
+            std::optional<double> t1, t2;
+            for (int a = 0; a < 3; ++a) {
+                if (a) QThread::msleep(150);
+                auto pr = sensor.read(); t1 = pr.first; t2 = pr.second;
+                if (t1 || t2) break;
+            }
+            if (!(t1 || t2)) {
+                if (cfg.pid_enabled || cfg.length_mode == sonocontrol::LengthMode::HoldAfterTarget) {
+                    QMessageBox::critical(this, "Preflight Failed",
+                        "This mode requires temperature feedback, but HH806AU returned no valid data after 3 attempts.");
+                    return false;
+                }
+                const auto choice = QMessageBox::warning(this, "Temperature Monitor Not Ready",
+                    "HH806AU returned no valid data after 3 attempts.\n\n"
+                    "Continue without temperature monitoring and software cutoff?",
+                    QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+                if (choice != QMessageBox::Yes) return false;
+                cfg.temperature_enabled = false; cfg.simulate_temp = false;
+            } else {
+                appendConsole(QString("Preflight: HH806AU OK  T1=%1  T2=%2")
+                    .arg(t1 ? QString::number(*t1, 'f', 2) + QString::fromUtf8("°C") : "N/C")
+                    .arg(t2 ? QString::number(*t2, 'f', 2) + QString::fromUtf8("°C") : "N/C"));
+            }
+        } catch (const std::exception& e) {
+            if (cfg.pid_enabled || cfg.length_mode == sonocontrol::LengthMode::HoldAfterTarget) { QMessageBox::critical(this, "Preflight Failed", qstr(e.what())); return false; }
+            const auto choice = QMessageBox::warning(this, "Temperature Monitor Not Ready",
+                QString("HH806AU could not be opened/read:\n\n") + qstr(e.what()) +
+                "\n\nContinue without temperature monitoring and software cutoff?",
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+            if (choice != QMessageBox::Yes) return false;
+            cfg.temperature_enabled = false; cfg.simulate_temp = false;
+        }
+        return true;
+    }
+
+    bool preflightCheckHyus(sonocontrol::Config& cfg) {
+        if (cfg.hyus_pulse_len_us > cfg.hyus_pulse_period_us) {
+            QMessageBox::warning(this, "Invalid Timing", "Pulse length must be ≤ pulse period. The run was not started.");
+            return false;
+        }
+        if (cfg.hyus_seq_len_ms > cfg.hyus_seq_period_ms) {
+            QMessageBox::warning(this, "Invalid Timing", "Sequence length must be ≤ sequence period. The run was not started.");
+            return false;
+        }
+        if (cfg.hyus_pulse_period_us > cfg.hyus_seq_len_ms * 1000.0) {
+            QMessageBox::warning(this, "Invalid Timing", "Pulse period must be ≤ sequence length. The run was not started.");
+            return false;
+        }
+        if ((cfg.pid_enabled || cfg.length_mode == sonocontrol::LengthMode::HoldAfterTarget) && cfg.cutoff_temp <= cfg.pid_setpoint) {
+            QMessageBox::warning(this, "Invalid Safety Limit", "Cutoff temperature must be higher than the target temperature.");
+            return false;
+        }
+        if (cfg.use_cycling && cfg.length_mode != sonocontrol::LengthMode::TotalDuration) {
+            QMessageBox::warning(this, "Invalid Cycle Mode", "Temperature cycling is only available in Total Duration mode.");
+            return false;
+        }
+        if (cfg.length_mode == sonocontrol::LengthMode::HoldAfterTarget && !cfg.temperature_enabled) {
+            QMessageBox::warning(this, "Temperature Required",
+                                 "After-target Hold mode requires temperature monitoring, because the hold timer starts only after the target temperature is reached.");
+            return false;
+        }
+        if (!hyusTemperaturePreflight(cfg)) return false;
+        return showPreflightConfirmation(cfg);
+    }
+
     bool preflightCheck(sonocontrol::Config& cfg) {
         const double duration_s = spnDuration_->value() / 1000.0;
         if (spnInterval_->value() < duration_s) {
             QMessageBox::warning(this, "Invalid Timing",
                                  "Interval must be greater than or equal to Duration. The experiment was not started.");
+            return false;
+        }
+        // Pulse period (1/PRF) must fit within the sequence length (Duration).
+        if (cfg.prf_hz > 0.0 && (1.0 / cfg.prf_hz) > duration_s) {
+            QMessageBox::warning(this, "Invalid Timing",
+                                 "Pulse period (1/PRF) must be less than or equal to Duration (sequence length). "
+                                 "Increase Duration or PRF. The experiment was not started.");
             return false;
         }
         // Soft warning when the interval is below the realistic transmit
@@ -3098,7 +4215,50 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         return true;
     }
 
+    QString configSummaryHyus(const sonocontrol::Config& cfg) const {
+        const double seqp_s = cfg.hyus_seq_period_ms / 1000.0;
+        const double total_s = (cfg.length_mode == sonocontrol::LengthMode::TotalDuration)
+            ? cfg.total_duration_mins * 60.0
+            : ((cfg.length_mode == sonocontrol::LengthMode::RepeatingCycles)
+                ? static_cast<double>(cfg.repeating) * seqp_s
+                : cfg.hold_after_target_mins * 60.0);
+        const char* pidVar = (cfg.hyus_pid_var == 0) ? "pulse amplitude"
+                           : (cfg.hyus_pid_var == 2) ? "sequence length/period" : "pulse length/period";
+        QString s;
+        s += "Hyus device (LAN / Ethernet)\n";
+        s += QString("  Device IP: %1\n\n").arg(QString::fromStdString(cfg.hyus_device_ip));
+        s += "Ultrasound output\n";
+        s += QString("  Pulse frequency: %1 MHz\n").arg(cfg.cfreq_hz / 1.0e6, 0, 'f', 3);
+        s += QString("  Pulse amplitude: %1 %\n").arg(cfg.amplitude * 100.0, 0, 'f', 1);
+        s += QString("  Pulse length / period: %1 / %2 us\n").arg(cfg.hyus_pulse_len_us, 0, 'f', 1).arg(cfg.hyus_pulse_period_us, 0, 'f', 1);
+        s += QString("  Sequence length / period: %1 / %2 ms\n\n").arg(cfg.hyus_seq_len_ms, 0, 'f', 3).arg(cfg.hyus_seq_period_ms, 0, 'f', 3);
+        s += "Experiment length\n";
+        if (cfg.length_mode == sonocontrol::LengthMode::TotalDuration) {
+            s += QString("  Mode: Total duration\n");
+            s += QString("  Planned total: %1 s (%2 h), repeating %3 cycles\n").arg(total_s, 0, 'f', 1).arg(total_s / 3600.0, 0, 'f', 2).arg(seqp_s > 0 ? static_cast<int>(total_s / seqp_s) : 0);
+            s += QString("  Cycling: %1\n").arg(cfg.use_cycling ? "enabled" : "disabled");
+        } else if (cfg.length_mode == sonocontrol::LengthMode::RepeatingCycles) {
+            s += QString("  Mode: Repeating cycles\n");
+            s += QString("  Repeating: %1 cycles (≈ %2 s)\n").arg(cfg.repeating).arg(total_s, 0, 'f', 1);
+        } else {
+            s += QString("  Mode: After target reached, hold\n");
+            s += QString("  Hold time after first target reach: %1 min (%2 s)\n").arg(cfg.hold_after_target_mins, 0, 'f', 1).arg(total_s, 0, 'f', 1);
+            s += QString("  Target reach criterion: setpoint ± %1 °C\n").arg(cfg.target_tolerance_c, 0, 'f', 2);
+            s += "  Total duration is not used in this mode.\n";
+        }
+        s += "\nTemperature / safety\n";
+        s += QString("  Temperature monitoring: %1\n").arg(cfg.temperature_enabled ? "enabled" : "disabled");
+        s += QString("  HH806AU: %1\n").arg(cfg.temperature_enabled ? (QString::fromStdString(cfg.com11_port) + (cfg.simulate_temp ? " [SIM]" : "")) : "not used");
+        s += QString("  Sampling rate: %1 Hz\n").arg(cfg.sampling_rate_hz, 0, 'f', 1);
+        s += QString("  PID: %1%2\n").arg(cfg.pid_enabled ? "enabled" : "disabled").arg(cfg.pid_enabled ? (QString(" — controls ") + pidVar) : QString());
+        if (cfg.pid_enabled || cfg.length_mode == sonocontrol::LengthMode::HoldAfterTarget) s += QString("  Target setpoint: %1 °C\n").arg(cfg.pid_setpoint, 0, 'f', 1);
+        s += QString("  Cutoff: %1 °C%2 (%3 samples)\n").arg(cfg.cutoff_temp, 0, 'f', 1).arg(cfg.temperature_enabled ? "" : " [inactive]").arg(cfg.cutoff_confirm_samples);
+        s += QString("  Config source: %1%2\n").arg(QString::fromStdString(cfg.config_source_type)).arg(cfg.config_file_path.empty() ? "" : (" [" + QString::fromStdString(cfg.config_file_path) + "]"));
+        return s;
+    }
+
     QString configSummary(const sonocontrol::Config& cfg) const {
+        if (cfg.device_kind == sonocontrol::DeviceKind::Hyus) return configSummaryHyus(cfg);
         const double total_s = (cfg.length_mode == sonocontrol::LengthMode::TotalDuration)
             ? cfg.total_duration_mins * 60.0
             : ((cfg.length_mode == sonocontrol::LengthMode::RepeatingCycles)
@@ -3152,6 +4312,8 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
                  .arg(cfg.pid_prediction_horizon_s, 0, 'f', 1)
                  .arg(cfg.pid_prediction_horizon_s <= 0.0 ? " [current interval]" : "");
         s += "  Prediction model: T_future = T + thermal_const × dT/dt × (1 - exp(-horizon/thermal_const))\n";
+        s += QString("  Temp smoothing window: %1 s (dT/dt least-squares fit span)\n")
+                 .arg(cfg.temp_rate_window_s, 0, 'f', 0);
         s += QString("  Config source: %1%2\n")
                  .arg(QString::fromStdString(cfg.config_source_type))
                  .arg(cfg.config_file_path.empty() ? "" : (" [" + QString::fromStdString(cfg.config_file_path) + "]"));
@@ -3263,7 +4425,21 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
             dlg.accept();
         });
         connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
-        layout->addWidget(buttons);
+
+        // PC power status, shown large just left of the Start button, refreshed
+        // while the dialog is open so unplugging mains is noticed immediately.
+        auto* battery = new BatteryIndicator;
+        battery->setStatus(acLineStatus());
+        auto* powerTimer = new QTimer(&dlg);
+        powerTimer->setInterval(2000);
+        connect(powerTimer, &QTimer::timeout, battery, [battery]{ battery->setStatus(acLineStatus()); });
+        powerTimer->start();
+        auto* btnRow = new QHBoxLayout;
+        btnRow->addStretch();
+        btnRow->addWidget(battery, 0, Qt::AlignVCenter);
+        btnRow->addSpacing(12);
+        btnRow->addWidget(buttons);
+        layout->addLayout(btnRow);
 
         if (dlg.exec() != QDialog::Accepted) return false;
 
@@ -3303,9 +4479,9 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
                 tempPlot_->render(&tempPix);
                 tempPix.save(qstr((outDir / "temperature_plot.png").string()));
             }
-            if (waveformPlot_) {
-                QPixmap wavePix(waveformPlot_->size());
-                waveformPlot_->render(&wavePix);
+            if (seqPlot_) {
+                QPixmap wavePix(seqPlot_->size());
+                seqPlot_->render(&wavePix);
                 wavePix.save(qstr((outDir / "waveform_plot.png").string()));
             }
             appendConsole("Auto-saved completed experiment artifacts to: " + qstr(outDir.string()));
@@ -3360,6 +4536,12 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
     }
 
     void applyConfigToUi(const sonocontrol::Config& cfg) {
+        // Widen the dynamically-constrained ranges before loading so a valid
+        // saved config is never clamped by ranges left over from prior edits.
+        if (spnDuration_) { spnDuration_->setMinimum(10.0); spnDuration_->setMaximum(60000.0); }
+        if (spnInterval_) { spnInterval_->setMinimum(sonocontrol::kMinIntervalTimeS); spnInterval_->setMaximum(3600.0); }
+        for (auto* s : {spnHyusPulseLenUs_, spnHyusPulsePeriodUs_}) if (s) { s->setMinimum(0.1); s->setMaximum(1000000.0); }
+        for (auto* s : {spnHyusSeqLenMs_, spnHyusSeqPeriodMs_}) if (s) { s->setMinimum(0.001); s->setMaximum(1000000.0); }
         spnAmp_->setValue(cfg.amplitude);
         spnCfreq_->setValue(cfg.cfreq_hz / 1000.0);
         spnPrf_->setValue(cfg.prf_hz);
@@ -3401,6 +4583,7 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         spnKd_->setValue(cfg.pid_kd);
         spnTau_->setValue(cfg.pid_prediction_tau_s);
         if (spnHorizon_) spnHorizon_->setValue(cfg.pid_prediction_horizon_s);
+        if (spnRateWindow_) spnRateWindow_->setValue(cfg.temp_rate_window_s);
         autoSaveDir_ = qstr(cfg.auto_save_dir);
         chkCycling_->setChecked(cfg.use_cycling);
         // Config stores phase durations in seconds; spinboxes display minutes.
@@ -3418,10 +4601,25 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         if (chkSimTemp_) chkSimTemp_->setChecked(cfg.simulate_temp);
         if (chkSimUs_) chkSimUs_->setChecked(cfg.simulate_us);
 #endif
+        // Restore Hyus parameters (config_io persists these for the Hyus device).
+        if (spnHyusFreqMhz_) spnHyusFreqMhz_->setValue(cfg.cfreq_hz / 1.0e6);
+        if (spnHyusAmpPct_) spnHyusAmpPct_->setValue(cfg.amplitude * 100.0);
+        if (spnHyusPulseLenUs_) spnHyusPulseLenUs_->setValue(cfg.hyus_pulse_len_us);
+        if (spnHyusPulsePeriodUs_) spnHyusPulsePeriodUs_->setValue(cfg.hyus_pulse_period_us);
+        if (spnHyusSeqLenMs_) spnHyusSeqLenMs_->setValue(cfg.hyus_seq_len_ms);
+        if (spnHyusSeqPeriodMs_) spnHyusSeqPeriodMs_->setValue(cfg.hyus_seq_period_ms);
+        if (rbHyusPidAmp_ && rbHyusPidPulse_ && rbHyusPidSeq_) {
+            if (cfg.hyus_pid_var == 0) rbHyusPidAmp_->setChecked(true);
+            else if (cfg.hyus_pid_var == 2) rbHyusPidSeq_->setChecked(true);
+            else rbHyusPidPulse_->setChecked(true);
+        }
         updateRepeatingFromDuration();
         updateLengthModeUi();
         onPidChanged(chkPid_->isChecked());
         onTempMonitoringChanged(chkTempMonitor_ && chkTempMonitor_->isChecked());
+        enforceHyusTiming();
+        enforceZhuhaiTiming();
+        updateSequencePreview();
     }
 
     void attachActiveConfigProvenance(sonocontrol::Config& cfg) const {
@@ -3528,7 +4726,7 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         if (chkWebLan_) c.web_server_lan = chkWebLan_->isChecked();
         c.web_server_enabled = false;  // session-only
 #endif
-        c.pid_setpoint = spnSetpoint_->value(); c.pid_amplitude = chkPidAmp_->isChecked(); c.pid_duration = chkPidDuration_->isChecked(); c.pid_duty = chkPidDuty_->isChecked(); c.pid_interval = chkPidInterval_->isChecked(); c.pid_kp = spnKp_->value(); c.pid_ki = spnKi_->value(); c.pid_kd = spnKd_->value(); c.pid_prediction_tau_s = spnTau_ ? spnTau_->value() : 25.0; c.pid_prediction_horizon_s = spnHorizon_ ? spnHorizon_->value() : 0.0; c.auto_save_dir = autoSaveDir_.toStdString();
+        c.pid_setpoint = spnSetpoint_->value(); c.pid_amplitude = chkPidAmp_->isChecked(); c.pid_duration = chkPidDuration_->isChecked(); c.pid_duty = chkPidDuty_->isChecked(); c.pid_interval = chkPidInterval_->isChecked(); c.pid_kp = spnKp_->value(); c.pid_ki = spnKi_->value(); c.pid_kd = spnKd_->value(); c.pid_prediction_tau_s = spnTau_ ? spnTau_->value() : 25.0; c.pid_prediction_horizon_s = spnHorizon_ ? spnHorizon_->value() : 0.0; c.temp_rate_window_s = spnRateWindow_ ? spnRateWindow_->value() : 30.0; c.auto_save_dir = autoSaveDir_.toStdString();
         c.use_cycling = chkCycling_->isChecked();
         // Spinboxes are in minutes; Config carries seconds (interface unchanged).
         c.heating_s = spnHeatS_->value() * 60.0;
@@ -3536,10 +4734,39 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         c.cooling_mode = rbCoolStop_->isChecked() ? sonocontrol::CoolingMode::Stop : sonocontrol::CoolingMode::Low; c.cooling_hold_temp = spnCoolHoldTemp_->value();
         c.com3_port = cmbCom3_->currentData().toString().toStdString(); c.com11_port = cmbCom11_->currentData().toString().toStdString(); c.temp_channel = static_cast<sonocontrol::TempChannel>(cmbTempChannel_->currentIndex()); c.temp_channel_fallback = chkTempFallback_ && chkTempFallback_->isChecked(); c.udp_host = txtUdpHost_->text().trimmed().toStdString(); c.udp_port = static_cast<uint16_t>(spnUdpPort_->value());
         c.simulate_temp = c.temperature_enabled && debugSimChecked(chkSimTemp_); c.simulate_us = debugSimChecked(chkSimUs_);
+
+        // --- Device selection + Hyus transport fields ---
+        c.device_kind = deviceKind_;
+        // IP comes from the auto-detected device dropdown; the TCP/beacon ports
+        // are protocol constants and are intentionally not user-exposed (kept at
+        // the config defaults 8192/8193).
+        if (cmbHyusDevice_ && !cmbHyusDevice_->currentText().trimmed().isEmpty())
+            c.hyus_device_ip = cmbHyusDevice_->currentText().trimmed().toStdString();
+        // Hyus device total-duration mode is only used for Total Duration.
+        // Repeating and After-target Hold are software-timed and stopped by
+        // the worker with RUN=0.
+        c.hyus_run_mode = (c.length_mode == sonocontrol::LengthMode::TotalDuration) ? 1 : 0;
+        if (deviceKind_ == sonocontrol::DeviceKind::Hyus) {
+            // Hyus reuses amplitude/cfreq_hz but takes them from its own inputs
+            // (carrier in MHz, amplitude in percent), and carries pulse/sequence
+            // timing in dedicated fields with no FPGA analog.
+            if (spnHyusFreqMhz_) c.cfreq_hz = spnHyusFreqMhz_->value() * 1.0e6;
+            if (spnHyusAmpPct_) c.amplitude = std::clamp(spnHyusAmpPct_->value() / 100.0, 0.0, 1.0);
+            if (spnHyusPulseLenUs_) c.hyus_pulse_len_us = spnHyusPulseLenUs_->value();
+            if (spnHyusPulsePeriodUs_) c.hyus_pulse_period_us = spnHyusPulsePeriodUs_->value();
+            if (spnHyusSeqLenMs_) c.hyus_seq_len_ms = spnHyusSeqLenMs_->value();
+            if (spnHyusSeqPeriodMs_) c.hyus_seq_period_ms = spnHyusSeqPeriodMs_->value();
+            // PID controlled variable (single-select). Default pulse-duty.
+            c.hyus_pid_var = (rbHyusPidAmp_ && rbHyusPidAmp_->isChecked()) ? 0
+                           : (rbHyusPidSeq_ && rbHyusPidSeq_->isChecked()) ? 2 : 1;
+        }
         return c;
     }
 
     void setupStatusProbe() {
+        // Runs for both devices. For Hyus the COM3/UDP checks are suppressed in
+        // pushProbeSettings() (those pills are hidden); only the temperature
+        // probe is relevant, feeding the restored Temp pill.
         probeThread_ = new QThread(this);
         probe_ = new StatusProbe();
         probe_->moveToThread(probeThread_);
@@ -3581,9 +4808,12 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
     void pushProbeSettings() {
         if (!probe_) return;
         StatusProbe::Settings s;
-        s.com3_port = cmbCom3_ ? cmbCom3_->currentData().toString() : QString();
+        const bool hyus = (deviceKind_ == sonocontrol::DeviceKind::Hyus);
+        // Hyus has no FPGA serial/UDP — suppress those checks (their pills are
+        // hidden); only the temperature probe is relevant.
+        s.com3_port = (hyus || !cmbCom3_) ? QString() : cmbCom3_->currentData().toString();
         s.com11_port = cmbCom11_ ? cmbCom11_->currentData().toString() : QString();
-        s.udp_host = txtUdpHost_ ? txtUdpHost_->text().trimmed() : QString();
+        s.udp_host = (hyus || !txtUdpHost_) ? QString() : txtUdpHost_->text().trimmed();
         s.udp_source_port = 4561;
         // Only probe the temperature sensor when the user actually wants
         // monitoring (or PID/target-hold force it). Otherwise the pill
@@ -3714,6 +4944,21 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         if (sequenceActive_ || running_) return;
         const auto items = sequenceDialog_->items();
         if (items.isEmpty()) return;
+        // Device match: every queued configuration must target the current
+        // device, otherwise the run would use the wrong transport/parameters.
+        {
+            QStringList bad;
+            for (const auto& it : items)
+                if (it.cfg.device_kind != deviceKind_) bad << QFileInfo(it.path).fileName();
+            if (!bad.isEmpty()) {
+                QMessageBox::critical(this, "Device mismatch",
+                    QString("These queued configurations target a different device than the current "
+                            "'%1' session and cannot be run:\n\n%2\n\nRemove them (or switch device), then retry.")
+                        .arg(deviceDisplayName(deviceKind_))
+                        .arg(bad.join("\n")));
+                return;
+            }
+        }
         savedSequenceItems_ = items;
         savedSequenceIntervalsMin_ = sequenceDialog_->intervalsMinutes();
         // Defensive normalization — should already match because seedState/
@@ -3776,6 +5021,11 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
                     worker_->forceStop();
                 }
             });
+        } else if (hyusWorker_) {
+            // Hyus item running: the worker sends RUN=0 and finishes, which
+            // routes to handleSequenceItemFinished and finalizes (because
+            // sequenceStopRequested_ is set).
+            hyusWorker_->requestStop();
         } else {
             // No worker currently running (we're in the inter-config gap) —
             // finalize the sequence right away.
@@ -3792,13 +5042,17 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         sonocontrol::Config cfg = savedSequenceItems_[sequenceIndex_].cfg;
         cfg.config_source_type = "sequence";
         cfg.config_file_path = savedSequenceItems_[sequenceIndex_].path.toStdString();
-        validate_config(cfg);
         if (sequenceDialog_) {
             sequenceDialog_->setCurrentIndex(sequenceIndex_);
             sequenceDialog_->setStatusText(QString("Running %1 of %2: %3")
                                               .arg(sequenceIndex_ + 1).arg(sequenceTotal_)
                                               .arg(QFileInfo(savedSequenceItems_[sequenceIndex_].path).fileName()));
         }
+        if (deviceKind_ == sonocontrol::DeviceKind::Hyus) {
+            launchHyusSequenceItem(cfg);
+            return;
+        }
+        validate_config(cfg);
         launchWorkerForConfig(cfg, /*fromSequence=*/true);
     }
 
@@ -4109,7 +5363,8 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
     QPushButton *btnStart_{}, *btnStop_{}, *btnTestTemp_{};
     QCheckBox *chkSimTemp_{}, *chkSimUs_{}, *chkPid_{}, *chkTempMonitor_{}, *chkTempFallback_{}, *chkTempRequired_{}, *chkPidAmp_{}, *chkPidDuration_{}, *chkPidInterval_{}, *chkPidDuty_{}, *chkCycling_{}, *chkConsole_{};
     QLabel *lblCom3Status_{}, *lblUsStatus_{}, *lblTempStatus_{}, *lblPortInfo_{}, *lblTempRequirement_{}, *lblConfigStatus_{};
-    QDoubleSpinBox *spnAmp_{}, *spnCfreq_{}, *spnPrf_{}, *spnDuty_{}, *spnDuration_{}, *spnInterval_{}, *spnSampleRate_{}, *spnTotalDur_{}, *spnTargetHoldMin_{}, *spnTargetTol_{}, *spnCutoff_{}, *spnSetpoint_{}, *spnKp_{}, *spnKi_{}, *spnKd_{}, *spnTau_{}, *spnHorizon_{}, *spnHeatS_{}, *spnCoolS_{}, *spnCoolHoldTemp_{}, *spnTempMin_{}, *spnTempMax_{}, *spnTempRate_{};
+    QLabel* lblLanStatus_ = nullptr;      // Hyus: LAN device-detected indicator
+    QDoubleSpinBox *spnAmp_{}, *spnCfreq_{}, *spnPrf_{}, *spnDuty_{}, *spnDuration_{}, *spnInterval_{}, *spnSampleRate_{}, *spnTotalDur_{}, *spnTargetHoldMin_{}, *spnTargetTol_{}, *spnCutoff_{}, *spnSetpoint_{}, *spnKp_{}, *spnKi_{}, *spnKd_{}, *spnTau_{}, *spnHorizon_{}, *spnRateWindow_{}, *spnHeatS_{}, *spnCoolS_{}, *spnCoolHoldTemp_{}, *spnTempMin_{}, *spnTempMax_{}, *spnTempRate_{};
     QSpinBox *spnRepeating_{}, *spnUdpPort_{};
     QComboBox *cmbWave_{}, *cmbCom3_{}, *cmbCom11_{}, *cmbTempChannel_{};
     QLineEdit *txtUdpHost_{};
@@ -4122,6 +5377,30 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
     QPlainTextEdit* console_{};
     QVector<QWidget*> pidWidgets_;
     QVector<QWidget*> tempWidgets_;
+
+    // --- New device (Hyus) support. Independent of the FPGA widgets above. ---
+    sonocontrol::DeviceKind deviceKind_ = sonocontrol::DeviceKind::SonoControlFpga;
+    QTabWidget* tabs_ = nullptr;          // kept so PID/CYCLE tabs can be disabled per-device
+    QGroupBox* grpUsFpga_ = nullptr;      // CONNECT: serial COM + UDP (SonoControl FPGA)
+    QGroupBox* grpUsHyus_ = nullptr;      // CONNECT: LAN device dropdown (Hyus)
+    QComboBox* cmbHyusDevice_ = nullptr;  // detected Hyus devices (by IP)
+    QLabel* lblHyusStatus_ = nullptr;
+    QStringList hyusKnownDevices_;        // for detecting newly-connected devices
+    std::unique_ptr<sonocontrol::hyus::HyusDiscovery> hyusDiscovery_;
+    QTimer hyusScanTimer_;                // polls hyusDiscovery_ to refresh the dropdown
+    QTimer hyusStopTimer_;                // single-shot end-of-run for total-duration mode
+    // Hyus PARAMS-tab inputs (created alongside the FPGA inputs; only one set is
+    // visible at a time so buildConfig()/applyConfigToUi() stay null-safe).
+    QDoubleSpinBox* spnHyusFreqMhz_ = nullptr;
+    QDoubleSpinBox* spnHyusAmpPct_ = nullptr;
+    QDoubleSpinBox* spnHyusPulseLenUs_ = nullptr;
+    QDoubleSpinBox* spnHyusPulsePeriodUs_ = nullptr;
+    QDoubleSpinBox* spnHyusSeqLenMs_ = nullptr;
+    QDoubleSpinBox* spnHyusSeqPeriodMs_ = nullptr;
+    PulseSequencePlot* seqPlot_ = nullptr;  // pulse-sequence schematic (both devices)
+    QRadioButton *rbHyusPidAmp_ = nullptr, *rbHyusPidPulse_ = nullptr, *rbHyusPidSeq_ = nullptr;
+    QThread* hyusWorkerThread_ = nullptr;
+    class HyusRunWorker* hyusWorker_ = nullptr;
 };
 
 } // namespace
@@ -4132,10 +5411,23 @@ int main(int argc, char** argv) {
     QApplication app(argc, argv);
     QApplication::setStyle("Fusion");
     app.setApplicationName("SonoControl");
-    app.setApplicationVersion("1.9.1");
-    SonoControlWindow w;
-    w.show();
-    return app.exec();
+    app.setApplicationVersion(SONOCONTROL_VERSION_STR);
+    // Device selection loop: pick a device, run a window, and if the user
+    // chooses Edit -> Switch Device, return here to pick again. Each window is
+    // scoped so its discovery socket (TCP 8192) is released before the next one
+    // binds. The chosen kind determines the window's tabs and connection fields.
+    for (;;) {
+        g_switchDeviceRequested = false;
+        const auto deviceKind = sonocontrol::gui::selectDevice();
+        if (!deviceKind) break;  // user cancelled the picker
+        {
+            SonoControlWindow w(*deviceKind);
+            w.show();
+            app.exec();
+        }  // window destroyed here, releasing its device connection
+        if (!g_switchDeviceRequested) break;
+    }
+    return 0;
 }
 
 #include "main_gui.moc"

@@ -1,5 +1,21 @@
 cmake_minimum_required(VERSION 3.20)
-project(SonoControlCpp VERSION 1.5.0 LANGUAGES CXX)
+# Keep VERSION in sync with include/version.hpp (single source of truth for the
+# app version stamped into the GUI About box and the Windows .exe Details tab).
+project(SonoControlCpp VERSION 2.0.0 LANGUAGES CXX)
+
+# Compile the Windows version resource (VS_VERSIONINFO) into the executables so
+# the .exe Properties -> Details tab shows a real version. RC is a no-op on
+# non-Windows toolchains, so guard the whole thing behind WIN32. version.rc does
+# #include "version.hpp"; the targets it is attached to already expose include/
+# on their INCLUDE_DIRECTORIES (via sonocontrol_core), and CMake forwards those
+# to the RC compiler with the right per-toolchain flag syntax, so no manual
+# -I/-I flag wrangling is needed here.
+if (WIN32)
+    enable_language(RC)
+    set(SONOCONTROL_VERSION_RC "${CMAKE_CURRENT_SOURCE_DIR}/resources/version.rc")
+else()
+    set(SONOCONTROL_VERSION_RC "")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,6 +32,8 @@ option(SONOCONTROL_BUILD_GUI "Build the Qt Widgets GUI executable" ON)
 
 set(SONOCONTROL_CORE_SOURCES
     src/protocol.cpp
+    src/hyus_protocol.cpp
+    src/hyus_net.cpp
     src/config_io.cpp
     src/pid.cpp
     src/temperature.cpp
@@ -45,7 +63,7 @@ else()
     target_compile_options(sonocontrol_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_executable(sonocontrol src/main.cpp)
+add_executable(sonocontrol src/main.cpp ${SONOCONTROL_VERSION_RC})
 target_link_libraries(sonocontrol PRIVATE sonocontrol_core)
 
 set_target_properties(sonocontrol PROPERTIES
@@ -114,7 +132,7 @@ if (SONOCONTROL_BUILD_GUI)
         else()
             message(WARNING "Qt Network was not found. The GUI will build, but the in-app monitoring web server will be disabled at compile time. Install Qt's Network module to enable it.")
         endif()
-        add_executable(sonocontrol_gui ${SONOCONTROL_GUI_SOURCES})
+        add_executable(sonocontrol_gui ${SONOCONTROL_GUI_SOURCES} ${SONOCONTROL_VERSION_RC})
         target_link_libraries(sonocontrol_gui PRIVATE sonocontrol_core ${QT_WIDGETS_LIB} ${QT_NETWORK_LIB})
         if (SONOCONTROL_HAS_NETWORK)
             target_compile_definitions(sonocontrol_gui PRIVATE SONOCONTROL_WEB_SERVER=1)

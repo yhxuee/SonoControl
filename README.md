@@ -2,15 +2,22 @@
 
 Ultrasound thermal controller — desktop application for driving an FPGA-based ultrasound device while monitoring and controlling temperature via a thermocouple meter.
 
+Current release: **2.0.0**
+
 ---
 
 ## Overview
 
-SonoControl sends serial and UDP commands to an ultrasound FPGA to transmit therapeutic ultrasound bursts at configurable frequency, power, duty cycle, and repetition rate. It simultaneously reads a Mastech HH806AU dual-channel thermocouple meter over a second serial port and optionally closes a PID loop to regulate tissue temperature. All data is streamed to a timestamped CSV log in real time.
+SonoControl supports two ultrasound controller families:
+
+- **Zhuhai / SonoControl FPGA**: serial COM control plus UDP waveform-table upload.
+- **Hyus LAN device**: Ethernet discovery/control using the TCP/UDP protocol captured in the development notes.
+
+Both device modes share the HH806AU dual-channel thermocouple path, safety cutoff, PID controls, after-target hold mode, sequence runner, and experiment logging. All data is streamed to timestamped CSV/JSON artifacts in real time.
 
 The project provides:
-- A **Qt GUI** (`sonocontrol_gui`) for interactive experiment control with live temperature and waveform plots.
-- A **CLI binary** (`sonocontrol`) for scripted or headless operation.
+- A **Qt GUI** (`sonocontrol_gui`) for interactive experiment control with live temperature and pulse-sequence plots.
+- A **CLI binary** (`sonocontrol`) for scripted or headless operation of the original FPGA workflow.
 
 ---
 
@@ -18,17 +25,19 @@ The project provides:
 
 | Category | Feature |
 |----------|---------|
-| Ultrasound | Amplitude, carrier frequency (kHz), PRF (Hz), duty cycle, duration, interval |
-| Waveforms | Sine, square, or triangle envelope over 4096-sample DDS table via UDP |
+| Device modes | Startup device picker for Zhuhai / SonoControl FPGA or Hyus LAN device |
+| FPGA ultrasound | Amplitude, carrier frequency (kHz), PRF (Hz), duty cycle, duration, interval |
+| FPGA waveforms | Sine, square, or triangle envelope over 4096-sample DDS table via UDP |
+| Hyus ultrasound | LAN discovery/control, pulse frequency/amplitude, pulse length/period, sequence length/period |
 | Temperature | HH806AU dual thermocouple (T1, T2, average), configurable channel fallback |
 | PID control | Kp/Ki/Kd with predictive thermal model: `T_future = T + τ × dT/dt × (1 − e^{−t/τ})` |
-| Experiment modes | Total duration, repeating cycles, or hold-after-target-reached |
+| Experiment modes | Total duration, repeating cycles, or hold-after-target-reached on both device modes |
 | Cycling | Alternating heating/cooling phases with configurable durations |
 | **Sequence** | **Queue multiple `.config` files back-to-back with per-gap intervals; each entry runs as an independent experiment with its own log** |
 | **Monitoring web server** | **Optional read-only HTTP endpoint (default 127.0.0.1:50896) that serves a self-contained HTML+JS page with the latest cached temperature samples, elapsed/remaining time, and run state. Configurable port, snapshot interval, and LAN-bind toggle. Off by default at every app launch.** |
 | Safety | Configurable temperature cutoff with debounce (N samples, min spacing); optional fail-closed mode that aborts on sustained sensor loss; PIN-gated manual stop (per run and per sequence) |
 | Logging | Streaming CSV log + JSON metadata; auto-save artifacts on completion |
-| GUI | Dark/light theme, real-time temperature plot, waveform preview, preflight checks |
+| GUI | Dark/light theme, real-time temperature plot, reference-style pulse-sequence preview, preflight checks |
 | Reliability | Exponential-backoff serial retry, persistent COM3 option, stall watchdog |
 
 ---
@@ -50,6 +59,7 @@ The project provides:
 |-----------------|-----------|---------|
 | Ultrasound FPGA | COM3 (9600 8N1) | Receives serial control packets |
 | Ultrasound FPGA | UDP target (default `192.168.0.2:5000`) | Receives 4096-sample waveform table |
+| Hyus LAN device | Ethernet, TCP server on `8192`, UDP beacon on `8193` | Receives scalar pulse/sequence parameters and run/stop commands |
 | Omega HH806AU   | COM5 (19200 8E1) | Dual-channel thermocouple readout |
 
 All port names, baud rates, and the UDP target are configurable.
@@ -115,19 +125,24 @@ Debug builds set `SONOCONTROL_DEBUG_SIM=1`, which enables the "Sim Temp" and "Si
 
 ### GUI
 
-Launch `sonocontrol_gui.exe`. The interface has four tabs on the left panel:
+Launch `sonocontrol_gui.exe`. At startup, choose the target device mode:
+
+- **Zhuhai / SonoControl FPGA** for the original COM3 + UDP hardware.
+- **Hyus LAN** for the Ethernet device. The PC listens on TCP `8192` and broadcasts the discovery beacon on UDP `8193`; the detected device appears in the CONNECT tab.
+
+The interface has four tabs on the left panel:
 
 | Tab | Purpose |
 |-----|---------|
-| **PARAMS** | Ultrasound parameters, timing, experiment length, safety cutoff |
-| **PID** | Enable PID, setpoint, Kp/Ki/Kd, thermal prediction constant and horizon |
+| **PARAMS** | Device-specific ultrasound timing, experiment length, safety cutoff, pulse-sequence preview |
+| **PID** | Enable PID, setpoint, Kp/Ki/Kd, thermal prediction constant, horizon, temperature smoothing window, and Hyus controlled-variable selection |
 | **CYCLE** | Heating/cooling cycle durations and cooling behaviour |
-| **CONNECT** | COM ports, UDP host/port, HH806AU settings, appearance |
+| **CONNECT** | FPGA COM/UDP fields or Hyus LAN discovery, HH806AU settings, appearance |
 
 **Workflow (single run):**
-1. Select COM ports in the CONNECT tab; click **Scan Ports** if needed.
+1. Select the device connection in the CONNECT tab. For FPGA, choose COM ports and UDP target; for Hyus, click **Scan** and select the detected LAN device.
 2. If using temperature monitoring, click **Test** next to the HH806AU port to verify sensor response.
-3. Set ultrasound parameters and experiment length in PARAMS.
+3. Set ultrasound parameters and experiment length in PARAMS. The pulse-sequence panel previews pulse length, pulse period, sequence length, sequence period, amplitude, and total-duration span.
 4. Optionally configure PID in the PID tab.
 5. Click **▶ START**. A preflight dialog shows a full configuration summary and requires confirmation.
 6. Click **■ EMERGENCY STOP** to stop. A graceful stop is attempted first; after 2 s the stop escalates to cancel pending I/O if the worker is wedged.
@@ -192,6 +207,7 @@ Temperature / PID:
   --pid-kd X            Derivative gain (default 0.2)
   --pid-tau X           Thermal time constant in seconds (default 25)
   --pid-horizon X       Prediction horizon in seconds (0 = use interval)
+  --temp-rate-window X  dT/dt smoothing window in seconds (default 30, range 5-600)
 
 Hardware:
   --com3 PORT           Ultrasound serial port (default COM3)
@@ -222,6 +238,18 @@ A `.config` file is a UTF-8 key-value text file. Lines starting with `#` or `;` 
 Example:
 
 ```ini
+[device]
+device_kind          = sonocontrol_fpga  # sonocontrol_fpga | hyus
+
+[hyus]
+hyus_device_ip       = 192.168.0.10
+hyus_pulse_len_us    = 160
+hyus_pulse_period_us = 400
+hyus_seq_len_ms      = 1
+hyus_seq_period_ms   = 1000
+hyus_run_mode        = 0
+hyus_pid_var         = 1              # 0 = amplitude, 1 = pulse duty, 2 = sequence duty
+
 [ultrasound]
 amplitude           = 0.6
 cfreq_hz            = 500000
@@ -256,6 +284,7 @@ pid_ki              = 0.05
 pid_kd              = 0.2
 pid_prediction_tau_s = 25.0
 pid_prediction_horizon_s = 0.0
+temp_rate_window_s  = 30.0   # dT/dt smoothing window (s); range 5-600
 
 [hardware]
 com3_port           = COM3
@@ -312,6 +341,14 @@ sonocontrol --write-config-template sonocontrol_config_template.config
 - The UDP destination defaults to `192.168.0.2:5000`. Change this in the CONNECT tab or via `--udp-host` / `--udp-port`.
 - If the FPGA is on a different subnet, ensure the host machine has a static IP on that subnet and no firewall blocks port 5000 UDP.
 
+### Hyus LAN Device (TCP/UDP)
+
+- Device mode is selected at GUI startup. Hyus mode uses its own PARAMS/CONNECT controls and does not upload the FPGA waveform table.
+- The PC runs the TCP server on port `8192` and broadcasts the discovery message on UDP port `8193`.
+- The device connects back to the PC and receives scalar parameter frames for carrier frequency, amplitude, pulse length/period, sequence length/period, run mode, total duration, trigger source, and RUN start/stop.
+- Hyus Total Duration uses the device total-duration mode. Repeating cycles and After-target Hold are software-timed and stopped with `RUN=0`.
+- After-target Hold in Hyus mode requires HH806AU temperature feedback, just like PID.
+
 ---
 
 ## Troubleshooting
@@ -336,7 +373,7 @@ sonocontrol --write-config-template sonocontrol_config_template.config
 - The UDP waveform burst sends 4096 individual 8-byte datagrams sequentially. On congested networks this can take tens of milliseconds; keep the FPGA on a direct or isolated Ethernet link.
 - Temperature sampling is limited to 2 Hz by the HH806AU poll cycle (~360 ms per read). Higher `sampling_rate_hz` settings do not increase actual data rate.
 - PID integral windup limit is hardcoded at ±10 (not configurable via the config file). For very slow systems this may be too tight.
-- The EMA smoothing coefficient (`α = 0.25`) is compile-time constant, not configurable. Adjust in `src/experiment.cpp` if needed.
+- The EMA coefficient (`α = 0.25`) that smooths the temperature *level* is compile-time constant, not configurable. Adjust in `src/experiment.cpp` if needed. (The separate dT/dt *slope* smoothing window **is** configurable — see `temp_rate_window_s` / `--temp-rate-window` / the PID tab's "Temp smoothing window", default 30 s.)
 - Cycling mode is only available in Total Duration mode; it is silently disabled in Repeating or Hold-After-Target modes.
 - Auto-save creates files only on clean completion (exit code 0). Manual stops and cutoff events do not trigger auto-save.
 - An experiment sequence continues to the next queued configuration even if the current one ends with an error (e.g. watchdog force-stop or hardware error). To abort the whole sequence in that case, either tick **Abort the rest of the sequence if a configuration fails** in the Sequence dialog before starting, or click the sequence's **■ Stop Sequence** button manually. The safety cutoff fires per-configuration as usual.
@@ -373,6 +410,8 @@ include/
   config.hpp          Config + ActiveParams structs; enums
   config_io.hpp       load/save/template/to_text declarations
   experiment.hpp      ExperimentRunner class + ExperimentCallbacks
+  hyus_net.hpp        Hyus TCP server / UDP discovery wrapper
+  hyus_protocol.hpp   Hyus frame builders and status parser
   logger.hpp          ExperimentLogger (streaming CSV + JSON metadata)
   pid.hpp             PIDController + apply_pid_to_params()
   protocol.hpp        Serial packet helpers; UDP burst builder; waveform arrays
@@ -383,6 +422,8 @@ include/
 src/
   config_io.cpp
   experiment.cpp      Main experiment loop (state machine)
+  hyus_net.cpp
+  hyus_protocol.cpp
   logger.cpp
   pid.cpp
   protocol.cpp        DDS math; waveform table generators
@@ -391,8 +432,8 @@ src/
   udp_socket.cpp
   main.cpp            CLI entry point + argument parser
   gui/
-    main_gui.cpp      Qt Widgets GUI (single-file, ~3500 lines, includes
-                      Sequence dialog and runner)
+    device_dialog.hpp Startup device picker
+    main_gui.cpp      Qt Widgets GUI (device modes, Sequence dialog, runners)
 ```
 
 ### Key design decisions

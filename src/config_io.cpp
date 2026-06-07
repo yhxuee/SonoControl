@@ -75,7 +75,15 @@ std::string temp_channel_to_string(TempChannel ch) {
 
 void parse_kv(Config& c, const std::string& key_raw, const std::string& value) {
     const auto key = lower(trim(key_raw));
-    if (key == "amplitude") c.amplitude = parse_double(value, key);
+    if (key == "device_kind") c.device_kind = device_kind_from_string(trim(value));
+    else if (key == "hyus_device_ip") c.hyus_device_ip = trim(value);
+    else if (key == "hyus_pulse_len_us") c.hyus_pulse_len_us = parse_double(value, key);
+    else if (key == "hyus_pulse_period_us") c.hyus_pulse_period_us = parse_double(value, key);
+    else if (key == "hyus_seq_len_ms") c.hyus_seq_len_ms = parse_double(value, key);
+    else if (key == "hyus_seq_period_ms") c.hyus_seq_period_ms = parse_double(value, key);
+    else if (key == "hyus_run_mode") c.hyus_run_mode = parse_int(value, key);
+    else if (key == "hyus_pid_var") c.hyus_pid_var = parse_int(value, key);
+    else if (key == "amplitude") c.amplitude = parse_double(value, key);
     else if (key == "cfreq_hz") c.cfreq_hz = parse_double(value, key);
     else if (key == "cfreq_khz") c.cfreq_hz = parse_double(value, key) * 1000.0;
     else if (key == "prf_hz") c.prf_hz = parse_double(value, key);
@@ -111,6 +119,7 @@ void parse_kv(Config& c, const std::string& key_raw, const std::string& value) {
     else if (key == "pid_kd") c.pid_kd = parse_double(value, key);
     else if (key == "pid_prediction_tau_s") c.pid_prediction_tau_s = parse_double(value, key);
     else if (key == "pid_prediction_horizon_s") c.pid_prediction_horizon_s = parse_double(value, key);
+    else if (key == "temp_rate_window_s") c.temp_rate_window_s = parse_double(value, key);
     else if (key == "auto_save_dir") c.auto_save_dir = trim(value);
     else if (key == "pid_dynamic_tau_enabled" || key == "pid_tau_rate_low_c_per_s" ||
              key == "pid_tau_cap_low_s" || key == "pid_tau_rate_mid_c_per_s" ||
@@ -196,6 +205,20 @@ std::string config_to_text(const Config& c, bool include_comments) {
         os << "# Format: key = value. Lines beginning with # or ; are ignored.\n";
         os << "# This template intentionally contains no max_demand, hold-demand, or dynamic-tau controls.\n\n";
     }
+    os << "[device]\n";
+    write_str(os, "device_kind", to_string(c.device_kind));
+    os << '\n';
+
+    os << "[hyus]\n";
+    write_str(os, "hyus_device_ip", c.hyus_device_ip);
+    write_num(os, "hyus_pulse_len_us", c.hyus_pulse_len_us);
+    write_num(os, "hyus_pulse_period_us", c.hyus_pulse_period_us);
+    write_num(os, "hyus_seq_len_ms", c.hyus_seq_len_ms);
+    write_num(os, "hyus_seq_period_ms", c.hyus_seq_period_ms);
+    write_int(os, "hyus_run_mode", c.hyus_run_mode);
+    write_int(os, "hyus_pid_var", c.hyus_pid_var);
+    os << '\n';
+
     os << "[ultrasound]\n";
     write_num(os, "amplitude", c.amplitude);
     write_num(os, "cfreq_hz", c.cfreq_hz);
@@ -240,6 +263,7 @@ std::string config_to_text(const Config& c, bool include_comments) {
     write_num(os, "pid_kd", c.pid_kd);
     write_num(os, "pid_prediction_tau_s", c.pid_prediction_tau_s);
     write_num(os, "pid_prediction_horizon_s", c.pid_prediction_horizon_s);
+    write_num(os, "temp_rate_window_s", c.temp_rate_window_s);
     os << '\n';
 
     os << "[cycling]\n";
