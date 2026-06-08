@@ -174,7 +174,10 @@ void validate_config(sonocontrol::Config& c) {
     c.watchdog_timeout_ms = std::clamp(c.watchdog_timeout_ms, 1000, 60000);
     c.pid_prediction_tau_s = std::clamp(c.pid_prediction_tau_s, 0.0, 3600.0);
     c.pid_prediction_horizon_s = std::clamp(c.pid_prediction_horizon_s, 0.0, 360.0);
-    c.temp_rate_window_s = std::clamp(c.temp_rate_window_s, 5.0, 600.0);
+    // sampling_rate_hz was floored at >= 0.1 above, so the window floor is finite.
+    c.temp_rate_window_s = std::clamp(c.temp_rate_window_s,
+                                      sonocontrol::rate_window_floor_s(c.sampling_rate_hz),
+                                      sonocontrol::kMaxRateWindowS);
     if (c.pid_enabled) {
         c.temperature_enabled = true;
     }
@@ -2354,6 +2357,15 @@ private slots:
         spnDuration_->setMaximum(spnInterval_->value() * 1000.0);
     }
 
+    // The dT/dt smoothing window cannot be narrower than one sample period, so
+    // its spinbox floor tracks the sample-rate spinbox. validate_config applies
+    // the same clamp; this just keeps the GUI from offering an invalid value.
+    void enforceRateWindowRange() {
+        if (!spnRateWindow_ || !spnSampleRate_) return;
+        QSignalBlocker b(spnRateWindow_);
+        spnRateWindow_->setMinimum(sonocontrol::rate_window_floor_s(spnSampleRate_->value()));
+    }
+
     // ---- Hyus LAN discovery / connection ----
     void startHyusDiscovery() {
         if (!hyusDiscovery_) hyusDiscovery_ = std::make_unique<sonocontrol::hyus::HyusDiscovery>();
@@ -2956,7 +2968,7 @@ private slots:
             "Kd  Derivative gain. Suppresses rapid rises; too much makes output noisy.\n"
             "Thermal const (tau)  Liquid time constant for the predictive model T_future = T + τ·dT/dt·(1 − e^(−t/τ)). Larger τ brakes earlier; τ = 0 disables prediction.\n"
             "Prediction horizon  Lookahead in seconds. 0 = use the current hardware interval.\n"
-            "Temp smoothing window  Span (seconds) of the least-squares fit that estimates dT/dt from the noisy probe. Larger = smoother but slower-reacting slope; default 30 s, range 5–600 s.\n"
+            "Temp smoothing window  Span (seconds) of the least-squares fit that estimates dT/dt from the noisy probe. Larger = smoother but slower-reacting slope; default 30 s, range 1/sample-rate to 60 s.\n"
             "\n"
             "Experiment length modes\n"
             "───────────────────────\n"
@@ -3675,13 +3687,22 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         spnKd_ = dspin(0.0,5.0,0.2,3,0.05);
         spnTau_ = dspin(0.0,3600.0,25.0,1,1.0);
         spnHorizon_ = dspin(0.0,300.0,0.0,1,1.0);
-        spnRateWindow_ = dspin(5.0,600.0,30.0,0,5.0);
+        // Range is [1/sample-rate, kMaxRateWindowS]. The absolute floor here
+        // (0.05 s = 1/20 Hz, the sample-rate spinbox max) is tightened to the
+        // live 1/sample-rate by enforceRateWindowRange(); two decimals so the
+        // sub-second floor is representable.
+        spnRateWindow_ = dspin(0.05,sonocontrol::kMaxRateWindowS,30.0,2,1.0);
         addRow(gg,0,"Kp",spnKp_,"");
         addRow(gg,1,"Ki",spnKi_,"");
         addRow(gg,2,"Kd",spnKd_,"");
         addRow(gg,3,"Thermal const",spnTau_,"s");
         addRow(gg,4,"Prediction horizon",spnHorizon_,"s");
         addRow(gg,5,"Temp smoothing window",spnRateWindow_,"s");
+        // Keep the window floor in lockstep with the sample rate (1/sample-rate).
+        enforceRateWindowRange();
+        if (spnSampleRate_)
+            connect(spnSampleRate_, qOverload<double>(&QDoubleSpinBox::valueChanged),
+                    this, [this](double){ enforceRateWindowRange(); });
         auto* tauNote = new QLabel("Model: T_future = T + thermal_const × dT/dt × (1 - exp(-horizon/thermal_const)). Set thermal_const=0 to disable prediction. Set horizon=0 to use the current hardware interval. The temp smoothing window is the span of the least-squares fit used to estimate dT/dt (larger = smoother but slower-reacting slope).");
         tauNote->setWordWrap(true);
         tauNote->setStyleSheet("color:#667085; font-size:12px;");
@@ -4313,7 +4334,7 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
                  .arg(cfg.pid_prediction_horizon_s <= 0.0 ? " [current interval]" : "");
         s += "  Prediction model: T_future = T + thermal_const × dT/dt × (1 - exp(-horizon/thermal_const))\n";
         s += QString("  Temp smoothing window: %1 s (dT/dt least-squares fit span)\n")
-                 .arg(cfg.temp_rate_window_s, 0, 'f', 0);
+                 .arg(cfg.temp_rate_window_s, 0, 'f', 2);
         s += QString("  Config source: %1%2\n")
                  .arg(QString::fromStdString(cfg.config_source_type))
                  .arg(cfg.config_file_path.empty() ? "" : (" [" + QString::fromStdString(cfg.config_file_path) + "]"));
@@ -4583,6 +4604,7 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
         spnKd_->setValue(cfg.pid_kd);
         spnTau_->setValue(cfg.pid_prediction_tau_s);
         if (spnHorizon_) spnHorizon_->setValue(cfg.pid_prediction_horizon_s);
+        enforceRateWindowRange();  // floor depends on the sample rate set above
         if (spnRateWindow_) spnRateWindow_->setValue(cfg.temp_rate_window_s);
         autoSaveDir_ = qstr(cfg.auto_save_dir);
         chkCycling_->setChecked(cfg.use_cycling);

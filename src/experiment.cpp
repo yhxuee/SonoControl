@@ -303,7 +303,8 @@ int ExperimentRunner::run() {
                 // still tracking real trends, and it runs on the *raw* channel
                 // average (not the EWMA) so the slope carries no filter lag —
                 // the fit itself is the smoother.
-                const double kRateWindowSeconds = std::clamp(config_.temp_rate_window_s, 5.0, 600.0);
+                const double kRateWindowSeconds = std::clamp(config_.temp_rate_window_s,
+                    rate_window_floor_s(config_.sampling_rate_hz), kMaxRateWindowS);
                 rate_window.emplace_back(t_rel, avg);
                 while (rate_window.size() > 2 &&
                        t_rel - rate_window.front().first > kRateWindowSeconds) {
@@ -311,9 +312,13 @@ int ExperimentRunner::run() {
                 }
                 const double window_span = rate_window.back().first - rate_window.front().first;
                 // Need enough lever arm in t before the slope is trustworthy;
-                // until ~5 s of data has accumulated, leave the rate at 0
-                // (prediction effectively off) rather than amplify start-up noise.
-                if (rate_window.size() >= 3 && window_span >= 5.0) {
+                // leave the rate at 0 (prediction effectively off) rather than
+                // amplify start-up noise until the window has filled. The warm-up
+                // is the configured window or 5 s, whichever is smaller, so a
+                // deliberately small window (down to one sample period) is not
+                // gated behind the old fixed 5 s wait.
+                const double warmup_span = std::min(kRateWindowSeconds, 5.0);
+                if (rate_window.size() >= 3 && window_span >= warmup_span) {
                     double sum_t = 0.0, sum_y = 0.0;
                     for (const auto& [t, y] : rate_window) { sum_t += t; sum_y += y; }
                     const double n = static_cast<double>(rate_window.size());

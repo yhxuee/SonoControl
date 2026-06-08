@@ -59,7 +59,7 @@ void print_usage(const char* exe) {
         << "  --pid-kp X --pid-ki X --pid-kd X\n"
         << "  --pid-tau X            Thermal constant seconds for T_future=T+tau*dT/dt*(1-exp(-horizon/tau)); 0 disables prediction\n"
         << "  --pid-horizon X        Prediction horizon seconds; 0 uses current hardware interval\n"
-        << "  --temp-rate-window X   Temperature smoothing window seconds for the dT/dt fit, default 30 (range 5-600)\n"
+        << "  --temp-rate-window X   Temperature smoothing window seconds for the dT/dt fit, default 30 (range 1/sample-rate to 60)\n"
         << "  --auto-save-dir DIR    Completed experiment artifact folder; also supported in .config\n"
         << "  --pid-duration         PID adjusts duration\n"
         << "  --pid-duty             PID adjusts duty cycle\n"
@@ -151,7 +151,9 @@ void validate_config(Config& c) {
     c.udp_port = std::max<uint16_t>(1, c.udp_port);
     c.pid_prediction_tau_s = std::clamp(c.pid_prediction_tau_s, 0.0, 3600.0);
     c.pid_prediction_horizon_s = std::clamp(c.pid_prediction_horizon_s, 0.0, 360.0);
-    c.temp_rate_window_s = std::clamp(c.temp_rate_window_s, 5.0, 600.0);
+    // sampling_rate_hz was floored at >= 0.1 above, so the window floor is finite.
+    c.temp_rate_window_s = std::clamp(c.temp_rate_window_s,
+                                      rate_window_floor_s(c.sampling_rate_hz), kMaxRateWindowS);
 }
 
 Config parse_args(int argc, char** argv, bool& protocol_check, bool& help, std::string& write_template_path) {

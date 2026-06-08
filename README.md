@@ -207,7 +207,7 @@ Temperature / PID:
   --pid-kd X            Derivative gain (default 0.2)
   --pid-tau X           Thermal time constant in seconds (default 25)
   --pid-horizon X       Prediction horizon in seconds (0 = use interval)
-  --temp-rate-window X  dT/dt smoothing window in seconds (default 30, range 5-600)
+  --temp-rate-window X  dT/dt smoothing window in seconds (default 30, range 1/sample-rate to 60)
 
 Hardware:
   --com3 PORT           Ultrasound serial port (default COM3)
@@ -284,7 +284,7 @@ pid_ki              = 0.05
 pid_kd              = 0.2
 pid_prediction_tau_s = 25.0
 pid_prediction_horizon_s = 0.0
-temp_rate_window_s  = 30.0   # dT/dt smoothing window (s); range 5-600
+temp_rate_window_s  = 30.0   # dT/dt smoothing window (s); range 1/sampling_rate_hz to 60
 
 [hardware]
 com3_port           = COM3

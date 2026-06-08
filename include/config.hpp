@@ -15,6 +15,21 @@ namespace sonocontrol {
 // value so a config file, CLI flag, and GUI spinbox cannot disagree.
 inline constexpr double kMinIntervalTimeS = 0.2;
 
+// Allowed range for `temp_rate_window_s`, the sliding-window width of the
+// least-squares dT/dt fit. The ceiling is a flat 60 s. The floor is one sample
+// period (1 / sampling_rate_hz): a window narrower than the spacing between
+// samples can never hold the extra points the regression needs, so the floor
+// tracks the sampling rate instead of being a fixed number. All three clamp
+// sites (CLI validate_config, GUI validate_config, and the experiment loop)
+// derive the floor through rate_window_floor_s() so the config file, CLI flag,
+// and GUI spinbox cannot disagree.
+inline constexpr double kMaxRateWindowS = 60.0;
+inline double rate_window_floor_s(double sampling_rate_hz) {
+    // Mirror the >= 0.1 Hz clamp validate_config applies to sampling_rate_hz so
+    // the floor stays finite even for a malformed/zero rate.
+    return 1.0 / (sampling_rate_hz > 0.1 ? sampling_rate_hz : 0.1);
+}
+
 enum class WaveShape { Sine, Square, Triangle };
 enum class TempChannel { T1 = 0, T2 = 1, Average = 2 };
 enum class CoolingMode { Stop, Low };
@@ -99,9 +114,10 @@ struct Config {
     // single-sample finite difference at 2 Hz is dominated by probe
     // quantisation; the regression over this window averages that out while
     // still tracking real trends. Larger = smoother but laggier slope; the
-    // slope stays 0 until ~5 s of data has accumulated regardless. Clamped to
-    // [5, 600] s by both validate_config paths so the GUI spinbox, CLI flag,
-    // and config file cannot disagree.
+    // slope stays 0 until the window has filled (or 5 s, whichever is smaller)
+    // regardless. Clamped to [1/sampling_rate_hz, kMaxRateWindowS] s — see
+    // rate_window_floor_s() / kMaxRateWindowS above — by both validate_config
+    // paths so the GUI spinbox, CLI flag, and config file cannot disagree.
     double temp_rate_window_s = 30.0;
 
     // Default folder for completed experiment artifacts. Empty = ./experiments/<session>.
