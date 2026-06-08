@@ -297,12 +297,15 @@ int ExperimentRunner::run() {
                 // dT/dt for the predictive model. A single-sample finite
                 // difference at 2 Hz is dominated by probe quantisation: ±0.1 °C
                 // of jitter over 0.5 s reads as ±0.2 °C/s — the entire clamp
-                // range — so the old rate was essentially noise. Instead fit a
+                // range. So once enough samples have accumulated we fit a
                 // least-squares line over a sliding window (temp_rate_window_s,
-                // default 30 s) and take its slope. The regression averages out per-sample noise while
-                // still tracking real trends, and it runs on the *raw* channel
-                // average (not the EWMA) so the slope carries no filter lag —
-                // the fit itself is the smoother.
+                // default 30 s) and take its slope: the regression averages out
+                // per-sample noise while still tracking real trends, and it runs
+                // on the *raw* channel average (not the EWMA) so the slope carries
+                // no filter lag — the fit itself is the smoother. Three points is
+                // the smallest window that actually smooths: a two-point
+                // least-squares line is identical to a plain finite difference,
+                // which is exactly the fallback used below before the window fills.
                 const double kRateWindowSeconds = std::clamp(config_.temp_rate_window_s,
                     rate_window_floor_s(config_.sampling_rate_hz), kMaxRateWindowS);
                 rate_window.emplace_back(t_rel, avg);
@@ -311,12 +314,14 @@ int ExperimentRunner::run() {
                     rate_window.pop_front();
                 }
                 const double window_span = rate_window.back().first - rate_window.front().first;
-                // Need enough lever arm in t before the slope is trustworthy;
-                // leave the rate at 0 (prediction effectively off) rather than
-                // amplify start-up noise until the window has filled. The warm-up
-                // is the configured window or 5 s, whichever is smaller, so a
-                // deliberately small window (down to one sample period) is not
-                // gated behind the old fixed 5 s wait.
+                // Smoothing needs both >=3 points and enough lever arm in t (the
+                // configured window or 5 s, whichever is smaller) before its slope
+                // is trustworthy. Until then — at start-up, or with a window too
+                // small to hold three samples — fall back to a plain finite
+                // difference over the span we do have instead of leaving the rate
+                // at 0, so the predictor always gets a usable slope. The baseline
+                // grows toward the warm-up span, so the fallback is noisiest only
+                // for the first sample or two and then steadily smooths in.
                 const double warmup_span = std::min(kRateWindowSeconds, 5.0);
                 if (rate_window.size() >= 3 && window_span >= warmup_span) {
                     double sum_t = 0.0, sum_y = 0.0;
@@ -332,6 +337,13 @@ int ExperimentRunner::run() {
                     if (sxx > 1e-9) {
                         control_rate_c_per_s = std::clamp(sxy / sxx, -0.20, 0.20);
                     }
+                } else if (window_span > 1e-9) {
+                    // Finite-difference fallback over the endpoints of whatever
+                    // window we have so far (a 2-point regression reduces to
+                    // exactly this) until the smoothing path above is available.
+                    control_rate_c_per_s = std::clamp(
+                        (rate_window.back().second - rate_window.front().second) / window_span,
+                        -0.20, 0.20);
                 }
 
 
